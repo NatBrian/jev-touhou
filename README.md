@@ -8,19 +8,35 @@ Left panel: the actual game window, recorded with ffmpeg while the game plays th
 
 **Laya, Hard, stage 1** (WON: 2 deaths, score 2,924,004)
 
-<video src="https://raw.githubusercontent.com/NatBrian/jev-touhou/main/videos/jev-showcase-real-laya-s1-hard.mp4" poster="doc/screenshots/screenshot-laya-s1-hard.png" controls width="760"></video>
+
+
+https://github.com/user-attachments/assets/3daebe75-b2d9-43f4-b09a-3bb58afaaab3
+
+
 
 **Laya, Normal, stage 1**
 
-<video src="https://raw.githubusercontent.com/NatBrian/jev-touhou/main/videos/jev-showcase-real-laya-s1-normal.mp4" poster="doc/screenshots/screenshot-laya-s1-normal.png" controls width="760"></video>
+
+
+https://github.com/user-attachments/assets/de58b3ef-cc85-44b3-ac5c-3b49884f43bd
+
+
 
 **Mica, Normal, stage 1**
 
-<video src="https://raw.githubusercontent.com/NatBrian/jev-touhou/main/videos/jev-showcase-real-mica-s1-normal.mp4" poster="doc/screenshots/screenshot-mica-s1-normal.png" controls width="760"></video>
+
+
+https://github.com/user-attachments/assets/6607328c-7a70-42a7-be4c-aeabfcb3ef4a
+
+
 
 **Mica, Normal, stage 2** (WON: 2 deaths, score 3,099,334)
 
-<video src="https://raw.githubusercontent.com/NatBrian/jev-touhou/main/videos/jev-showcase-real-mica-s2-normal.mp4" poster="doc/screenshots/screenshot-mica-s2-normal.png" controls width="760"></video>
+
+
+https://github.com/user-attachments/assets/85a4b37d-8531-44fe-9d5b-2e317b2ff0dc
+
+
 
 All showcase runs: fresh 3 lives, no bombs, Marisa (shot mode A), fixed seed `12345+stage`, and the VA4 reflex executor (`--gap-horizon --laser-blind-fix --laser-ring`).
 
