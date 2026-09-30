@@ -1,0 +1,13 @@
+# Core Python dependencies (measured on Python 3.11).
+# The harness/ decision loop itself is stdlib-only (urllib/ctypes/json);
+# these are for the tools/ pipeline and the meson/ninja build steps.
+meson>=1.12
+ninja
+numpy
+zstandard
+pillow
+
+# Optional: offline local Laya dev sandbox (iterate on state/question text
+# without the GPU host). Pulls torch + the laya package:
+# laya[serve]
+# torch

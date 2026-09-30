@@ -1,0 +1,60 @@
+# --- Recreatable binaries & toolchains (fetch scripts/URLs recorded in doc/) ---
+venv/
+cache/
+build/
+build-*/
+third_party/mingw/
+third_party/gettext/
+third_party/llvm-mingw/
+third_party/*.zip
+third_party/taisei-1.4.6/
+
+# Nested project with its OWN git history (taisei v1.4.6 + sim layer, built via
+# third_party/simlayer-onto-v146.patch — see doc/research-taisei-sim.md).
+# Deliberately not part of this repo.
+third_party/taisei-sim/
+
+# --- Local run evidence & internal planning (kept on the author's machine,
+#     deliberately NOT part of the public repo) ---
+logs/
+# Only the four showcase videos below are tracked (referenced by the README).
+videos/*
+!videos/jev-showcase-real-laya-s1-hard.mp4
+!videos/jev-showcase-real-laya-s1-normal.mp4
+!videos/jev-showcase-real-mica-s1-normal.mp4
+!videos/jev-showcase-real-mica-s2-normal.mp4
+doc/PLAN.md
+doc/plan-*.md
+tools/reaudit_full.txt
+/AGENTS.md
+
+# Local-only machine-state tools (author's machine, not part of the setup)
+/tools/check_croot_integrity.py
+/tools/full_reaudit.py
+/tools/hp_check.py
+/tools/junk_pf_scan.py
+/tools/precopy_audit.py
+/tools/repair_croot.py
+/tools/verify_repair_done.py
+
+# --- simdata: local run evidence. Only the two sample runs below are tracked
+#     (see README "Sample data"). Everything else is ignored. ---
+simdata/*
+!simdata/replays/
+simdata/replays/*
+!simdata/replays/m3cam-0927-162641-stage1-hard.trsr
+!simdata/replays/m3cam-0927-162641-stage2-hard.trsr
+!simdata/replays/perf-m3cam-0927-162641-s1-hard.trsr
+!simdata/replays/micacam-0930-012401-stage2-normal.trsr
+!simdata/replays/perf-micacam-0930-012401-s2-normal.trsr
+!simdata/checkpoints/
+simdata/checkpoints/*
+!simdata/checkpoints/m3cam-0927-162641-stage1.json
+!simdata/checkpoints/m3cam-0927-162641-stage2.json
+!simdata/checkpoints/micacam-0930-012401-stage2.json
+!simdata/laya-m3cam-0927-162641.jsonl
+!simdata/laya-micacam-0930-012401.jsonl
+
+# Python
+__pycache__/
+*.pyc

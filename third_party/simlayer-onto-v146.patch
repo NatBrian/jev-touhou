@@ -1,0 +1,4380 @@
+diff --git a/.gitignore b/.gitignore
+index 7e11c235..06745fc5 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -15,4 +15,7 @@ __pycache__
+ *-autosave.kra
+ *.swp
+ .VERSION
++.venv
+ subprojects/.wraplock
++rust/target
++episode.tsr
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 00000000..991573ae
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,29 @@
++SHELL := /bin/bash
++.SHELLFLAGS := -euo pipefail -c
++.ONESHELL:
++
++PROJECT_ROOT := $(CURDIR)
++BUILD_DIR := $(PROJECT_ROOT)/build
++VENV_DIR := $(PROJECT_ROOT)/.venv
++
++build:
++	command -v python3 >/dev/null 2>&1
++
++	if [ ! -d "$(VENV_DIR)" ]; then
++		python3 -m venv "$(VENV_DIR)"
++	fi
++
++	source "$(VENV_DIR)/bin/activate"
++
++	python -m pip install backports.zstd
++	git submodule update --init --recursive
++
++	if [ ! -d "$(BUILD_DIR)" ]; then
++		meson setup "$(BUILD_DIR)"
++	else
++		meson setup "$(BUILD_DIR)" --reconfigure
++	fi
++
++	meson compile -C "$(BUILD_DIR)"
++	meson install -C "$(BUILD_DIR)"
++
+diff --git a/meson.build b/meson.build
+index 6723fc1c..c9db8a2a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -205,7 +205,13 @@ dep_libunibreak = dependency('libunibreak',                         required : t
+ dep_m           = cc.find_library('m', required : false)
+ 
+ dep_basisu_transcoder = subproject('basis_universal').get_variable('basisu_transcoder_dep')
+-dep_koishi      = subproject('koishi').get_variable('koishi_dep')
++# MSVC cannot compile gas-syntax `.S` files (koishi's fcontext backend), so use
++# native Windows fibers there. (Local patch for the Windows build; harmless elsewhere.)
++koishi_default_options = []
++if cc.get_id() == 'msvc'
++    koishi_default_options += 'impl=win32fiber'
++endif
++dep_koishi      = subproject('koishi', default_options: koishi_default_options).get_variable('koishi_dep')
+ 
+ sub_glad = subproject('glad')
+ dep_glad_gl = sub_glad.get_variable('glad_gl_dep')
+@@ -296,12 +302,25 @@ endif
+ config.set('TAISEI_BUILDCONF_HAVE_BUILTIN_POPCOUNTLL', cc.has_function('__builtin_popcountll'))
+ config.set('TAISEI_BUILDCONF_HAVE_BUILTIN_POPCOUNT', cc.has_function('__builtin_popcount'))
+ config.set('TAISEI_BUILDCONF_HAVE_BUILTIN_AVAILABLE', cc.has_function('__builtin_available'))
+-config.set('TAISEI_BUILDCONF_HAVE_ALIGNED_ALLOC', cc.has_function('aligned_alloc'))
++# has_function() is a LINK check. On MinGW-w64 the CRT exports the
++# posix_memalign / aligned_alloc symbols, but NO header declares them, so the
++# checks pass while the real compile fails with
++#   error: implicit declaration of function 'posix_memalign'
++#         [-Werror=implicit-function-declaration]
++# (observed with MSYS2 GCC 16, 2026-09-25). Force the checks to also require a
++# visible declaration from <stdlib.h>. On Windows this correctly leaves only
++# the WIN32 _aligned_malloc path (declared via <corecrt_malloc.h>).
++malloc_check_args = ['-Werror=implicit-function-declaration']
++malloc_check_prefix = '#include <stdlib.h>\n#include <stddef.h>\n'
++config.set('TAISEI_BUILDCONF_HAVE_ALIGNED_ALLOC',
++    cc.has_function('aligned_alloc', prefix : malloc_check_prefix, args : malloc_check_args))
+ # XXX: meson thinks posix_memalign exists on Switch
+ config.set('TAISEI_BUILDCONF_HAVE_POSIX_MEMALIGN',
+-    host_machine.system() != 'nx' and cc.has_function('posix_memalign'))
++    host_machine.system() != 'nx' and
++    cc.has_function('posix_memalign', prefix : malloc_check_prefix, args : malloc_check_args))
+ config.set('TAISEI_BUILDCONF_HAVE_ALIGNED_MALLOC_FREE',
+-    cc.has_function('_aligned_malloc') and cc.has_function('_aligned_free'))
++    cc.has_function('_aligned_malloc', prefix : malloc_check_prefix, args : malloc_check_args) and
++    cc.has_function('_aligned_free', prefix : malloc_check_prefix, args : malloc_check_args))
+ 
+ config.set('TAISEI_BUILDCONF_HAVE_ATTR_DESIGNATED_INIT', cc.compiles(
+     'struct { int dummy; } __attribute__((designated_init)) x;',
+diff --git a/src/boss.c b/src/boss.c
+index db12d177..40da0cfb 100644
+--- a/src/boss.c
++++ b/src/boss.c
+@@ -1061,15 +1061,17 @@ void boss_finish_current_attack(Boss *boss) {
+ 		boss_give_spell_bonus(boss, boss->current, &global.plr);
+ 
+ 		if(!attack_was_failed(boss->current)) {
+-			StageProgress *p = get_spellstage_progress(boss->current, NULL, true);
++			if(!global.is_simulation) {
++				StageProgress *p = get_spellstage_progress(boss->current, NULL, true);
+ 
+-			if(p) {
+-				progress_register_stage_cleared(p, global.plr.mode);
+-			}
++				if(p) {
++					progress_register_stage_cleared(p, global.plr.mode);
++				}
+ 
+-			// HACK
+-			if(spell_is_overload(boss->current->info)) {
+-				stage_unlock_bgm("bonus0");
++				// HACK
++				if(spell_is_overload(boss->current->info)) {
++					stage_unlock_bgm("bonus0");
++				}
+ 			}
+ 		} else if(boss->current->type != AT_ExtraSpell) {
+ 			boss->failed_spells++;
+@@ -1390,18 +1392,20 @@ void boss_start_next_attack(Boss *b, Attack *a) {
+ 	b->current = a;
+ 	log_debug("[%i] %s", global.frames, a->name);
+ 
+-	StageInfo *i;
+-	StageProgress *p = get_spellstage_progress(a, &i, true);
++	if(!global.is_simulation) {
++		StageInfo *i;
++		StageProgress *p = get_spellstage_progress(a, &i, true);
+ 
+-	if(p) {
+-		if(!p->unlocked) {
+-			char title[STAGE_MAX_TITLE_SIZE];
+-			stagetitle_format_localized(&i->title, sizeof(title), title);
+-			log_info("Spellcard unlocked! %s: %s", title, _(i->subtitle));
+-			p->unlocked = true;
+-		}
++		if(p) {
++			if(!p->unlocked) {
++				char title[STAGE_MAX_TITLE_SIZE];
++				stagetitle_format_localized(&i->title, sizeof(title), title);
++				log_info("Spellcard unlocked! %s: %s", title, _(i->subtitle));
++				p->unlocked = true;
++			}
+ 
+-		progress_register_stage_played(p, global.plr.mode);
++			progress_register_stage_played(p, global.plr.mode);
++		}
+ 	}
+ 
+ 	// This should go before a->rule(b,EVENT_BIRTH), so it doesn’t reset values set by the attack rule.
+diff --git a/src/dialog/marisa.c b/src/dialog/marisa.c
+index 0e4c444f..2e1feb9d 100644
+--- a/src/dialog/marisa.c
++++ b/src/dialog/marisa.c
+@@ -14,57 +14,13 @@
+ 
+ DIALOG_TASK(marisa, Stage1PreBoss) {
+ 	DIALOG_BEGIN(Stage1PreBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(cirno);
+-	HIDE(cirno);
+-
+-	FACE(marisa, puzzled);
+-	MSG(marisa, "Snow again? But I just put away my winter coat.");
+-	FACE(marisa, sweat_smile);
+-	MSG(marisa, "…even though it’s half-way through summer already.");
+-
+ 	EVENT(boss_appears);
+-	MSG(cirno, "Don’t you like the cold weather???");
+-
+-	SHOW(cirno);
+-	FACE(cirno, normal);
+-	MSG(cirno, "It should be winter all the time!");
+-
+-	FACE(marisa, normal);
+-	MSG(marisa, "Mind paying to get my coat cleaned, then?");
+-	FACE(marisa, sweat_smile);
+-	MSG(marisa, "I was gonna get it done in the fall, but now…");
+-
+-	TITLE_CIRNO(cirno);
+-	MSG(cirno, "Why would I do that?! You’re never going to pay me back!");
+ 	EVENT(music_changes);
+-	FACE(cirno, angry);
+-	MSG(cirno, "I’m gonna turn you into an ice cube!");
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Really? I prefer shaved ice, myself.");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(marisa, Stage1PostBoss) {
+ 	DIALOG_BEGIN(Stage1PostBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(cirno);
+-	VARIANT(cirno, defeated);
+-	FACE(cirno, defeated);
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Why don’t you go play with your new friend, the one from Hell?");
+-	MSG(marisa, "Maybe then it’d be more of a fair fight.");
+-
+-	MSG(cirno, "Ouch…");
+-	MSG(cirno, "I-I mean, last time she lost! And next time, you will too!");
+-
+-	MSG(marisa, "Sure, sure.");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -74,57 +30,13 @@ DIALOG_TASK(marisa, Stage1PostBoss) {
+ 
+ DIALOG_TASK(marisa, Stage2PreBoss) {
+ 	DIALOG_BEGIN(Stage2PreBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(hina);
+-	HIDE(hina);
+-	FACE(marisa, unamused);
+-	MSG(marisa, "Geez, this place is kinda sad now.");
+-	MSG(marisa, "What would be causin’ the yōkai to get all weird, anyways?");
+-
+ 	EVENT(boss_appears);
+-	MSG(hina, "Why hello, Ms. Kirisame.");
+-	SHOW(hina);
+-	FACE(hina, normal);
+-	MSG(hina, "You seem to be as reckless as always. I recommend turning back.");
+-
+-	FACE(marisa, happy);
+-	MSG(marisa, "Thanks for the advice! I’ll be ignoring it, though.");
+-	MSG(marisa, "See ya.");
+-
+-	TITLE_HINA(hina);
+-	FACE(hina, serious);
+-	MSG(hina, "Oh my… you’re quite the rebellious one, aren’t you?");
+-	MSG(hina, "Such confidence, ignoring my warning like that.");
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "I’ll take that as a compliment.");
+-
+ 	EVENT(music_changes);
+-	MSG(hina, "And do you know what happens to naughty girls who don’t listen to their elders?");
+-	MSG(hina, "They get showered in misfortune for years!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(marisa, Stage2PostBoss) {
+ 	DIALOG_BEGIN(Stage2PostBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(hina);
+-	VARIANT(hina, defeated);
+-	FACE(hina, defeated);
+-	FACE(marisa, unamused);
+-	MSG(marisa, "You’re way more snippy than usual today.");
+-	MSG(marisa, "It’s kinda annoyin’, honestly.");
+-
+-	MSG(hina, "H-how mean…");
+-	MSG(hina, "Don’t you see I was just trying to keep you safe…?");
+-
+-	MSG(marisa, "Don’t get all motherly on me now.");
+-	FACE(marisa, sweat_smile);
+-	MSG(marisa, "I’ve had enough of that for a lifetime.");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -134,97 +46,13 @@ DIALOG_TASK(marisa, Stage2PostBoss) {
+ 
+ DIALOG_TASK(marisa, Stage3PreBoss) {
+ 	DIALOG_BEGIN(Stage3PreBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(wriggle);
+-	HIDE(wriggle);
+-	FACE(marisa, normal);
+-	MSG(marisa, "Geez, everyone’s getting even more reckless the further up I go. What gives?");
+-
+ 	EVENT(boss_appears);
+-	MSG(wriggle, "Wait ‘til you meet their leader!");
+-	SHOW(wriggle);
+-
+-	MSG(marisa, "Yeah, I’m gonna have to ask their leader a bunch‘a questions for sure.");
+-
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "Feel free to go ahead. I’m listening.");
+-
+-	MSG(marisa, "Oh, you’re the messenger?");
+-	FACE(marisa, happy);
+-	MSG(marisa, "Mind passin’ a message along?");
+-
+-	TITLE_WRIGGLE(wriggle);
+-	FACE(wriggle, outraged);
+-	MSG(wriggle, "Um, OBVIOUSLY I’m not the messenger!");
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "Yeah, I’m the great leader of Insectkind!");
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Great leader? What, did the insects unionize or somethin’?");
+-
+-	FACE(wriggle, outraged);
+-	MSG(wriggle, "No! I told you, I’m the leader! The mastermind!");
+-	FACE(wriggle, calm);
+-	MSG(wriggle, "So, what’s your question?");
+-
+-	FACE(marisa, normal);
+-	MSG(marisa, "Hmm, guess I forgot.");
+-	MSG(marisa, "What’s yer deal, anyways?");
+-
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "We insects have three demands:");
+-	MSG(wriggle, "First: say nay to insect spray!");
+-	MSG(wriggle, "Second: swat the swatters!");
+-	FACE(wriggle, outraged);
+-	MSG(wriggle, "Third: the right to bite!");
+-	MSG(wriggle, "Fourth—!");
+-
+-	FACE(marisa, unamused);
+-	MSG(marisa, "Okay okay, this is great ‘n all, but I’ve honestly got more important stuff to do.");
+-	MSG(marisa, "… and ya don’t got a clue about what’s goin’ on, do ya?");
+-
+ 	EVENT(music_changes);
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "Maybe I know more than you think.");
+-	FACE(wriggle, outraged);
+-	MSG(wriggle, "But it’s NOTHING I’d tell an usurper of Insectkind’s glory!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(marisa, Stage3PostBoss) {
+ 	DIALOG_BEGIN(Stage3PostBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(wriggle);
+-	VARIANT(wriggle, defeated);
+-	FACE(wriggle, defeated);
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Tougher than usual, but not tough enough.");
+-	MSG(marisa, "Where’d ya pick up those new moves, anyway?");
+-
+-	MSG(wriggle, "Aw! It was, um… the great vision of our glorious Insect past!");
+-	MSG(wriggle, "It was in the age of Car—… Carb—… the age of Carbs!");
+-
+-	FACE(marisa, puzzled);
+-	MSG(marisa, "‘Glorious insect past’? ‘Carbs’?");
+-	FACE(marisa, normal);
+-	MSG(marisa, "Oh, ya must mean the Carboniferous Period. With the giant bug- err, insects, ‘n all that.");
+-	MSG(marisa, "I remember that doctor at Eientei goin’ off about it once.");
+-	FACE(marisa, sweat_smile);
+-	MSG(marisa, "Only time I’d seen her so excited…");
+-
+-	MSG(wriggle, "Yeah, that!");
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "Do you want to be an ally in our glorious conquest…?");
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Maybe later.");
+-	FACE(marisa, happy);
+-	MSG(marisa, "Probably never.");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -234,129 +62,13 @@ DIALOG_TASK(marisa, Stage3PostBoss) {
+ 
+ DIALOG_TASK(marisa, Stage4PreBoss) {
+ 	DIALOG_BEGIN(Stage4PreBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(kurumi);
+-	HIDE(kurumi);
+-
+-	FACE(marisa, surprised);
+-	MSG(marisa, "Oh wow, a mysterious, magical mansion!");
+-	FACE(marisa, smug);
+-	MSG(marisa, "… how generic can you get?");
+-
+ 	EVENT(boss_appears);
+-	MSG(kurumi, "And to top it off, a western witch!");
+-	SHOW(kurumi);
+-	MSG(kurumi, "Seen it a thousand times already. It’s such a boring motif.");
+-
+-	FACE(marisa, happy);
+-	MSG(marisa, "Right? But I make up for it with my devilish charm.");
+-
+-	FACE(kurumi, dissatisfied);
+-	MSG(kurumi, "But that theme is so overdone…");
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "What’s next? A maid?");
+-	FACE(marisa, normal);
+-	MSG(kurumi, "A little girl with almost no dialogue who becomes a fan-favourite anyways?");
+-	MSG(kurumi, "One that’ll have her personality massacred by the fans?");
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Maybe they’ll even make her something edgy like a vampire to drive up sales.");
+-
+-	FACE(kurumi, dissatisfied);
+-	MSG(kurumi, "Ugh! Maybe I’ve been reading too much manga that those tengu churn out.");
+-
+-	FACE(marisa, puzzled);
+-	MSG(marisa, "The tengu write manga now?");
+-	FACE(marisa, sweat_smile);
+-	MSG(marisa, "Writin’ pure ficiton is more honest for them, I guess.");
+-
+-	TITLE_KURUMI(kurumi);
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "Yeah, duh?");
+-	MSG(kurumi, "Of course, most of it is garbage that only weirdos like!");
+-	FACE(kurumi, dissatisfied);
+-	MSG(kurumi, "And don’t EVEN get me started on certain character designs! So generic!");
+-
+-	FACE(marisa, normal);
+-	MSG(marisa, "Maybe they oughta hire someone with some fashion sense.");
+-
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "That’d be me, then!");
+-	MSG(kurumi, "My ideas would surely make a splash, if they’d recognize my talent!");
+-
+-	FACE(marisa, unamused);
+-	MSG(marisa, "Eh? Maybe…");
+-
+-	FACE(kurumi, dissatisfied);
+-	MSG(kurumi, "Huh?!");
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Your outfit’s missin’ somethin'…");
+-
+-	FACE(kurumi, tsun_blush);
+-	MSG(kurumi, "H-Hmph! I could say the same about you!");
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "Seriously, it’s just a plain generic witch outfit!");
+-
+-	FACE(marisa, unamused);
+-	MSG(marisa, "That’s just because it’s summer!");
+-	FACE(marisa, happy);
+-	MSG(marisa, "My winter petticoats are legendary. Girls across Gensōkyō talk about ‘em.");
+-	FACE(marisa, normal);
+-	MSG(marisa, "In fact, there’s a few of ‘em, uh, deeper inside this mansion.");
+-	FACE(marisa, happy);
+-	MSG(marisa, "So I’ll be headin’ in, then.");
+-
+ 	EVENT(music_changes);
+-	FACE(kurumi, tsun);
+-	MSG(kurumi, "Oh, I’m not letting you go without a fight!");
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "Let’s see who’s the most fashionable here, witch!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(marisa, Stage4PostBoss) {
+ 	DIALOG_BEGIN(Stage4PostBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(kurumi);
+-	VARIANT(kurumi, defeated);
+-	FACE(kurumi, defeated);
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Whoever has the best petticoat wins. It’s a scientific fact.");
+-	FACE(marisa, sweat_smile);
+-	MSG(marisa, "… but since when do I care about scientific facts?");
+-
+-	MSG(kurumi, "W-wait, what was I doing again?");
+-	MSG(kurumi, "(Y-yeah, that’s it, play it off as amnesia…");
+-	MSG(kurumi, "(But, hmm… haven’t I seen this nerdy-looking girl before…?)");
+-	MSG(kurumi, "Uuu, I don’t remember anything at all!!");
+-
+-	FACE(marisa, normal);
+-	MSG(marisa, "Ah, sorry, sorry. I think ya slipped ‘n hit your head.");
+-	FACE(marisa, sweat_smile);
+-	MSG(marisa, "I’m Gensōkyō’s… petticoat inspector.");
+-	FACE(marisa, smug);
+-	MSG(marisa, "I’m here to inspect the petticoats in this here mansion.");
+-	FACE(marisa, happy);
+-	MSG(marisa, "Ya were just lettin’ me in, so I’ll be off, then.");
+-
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "Uhm, I kind of doubt that…");
+-	FACE(kurumi, defeated);
+-	MSG(kurumi, "Not that I could stop you, anyways…");
+-	FACE(marisa, normal);
+-	MSG(kurumi, "Ugh, I didn’t sign up to get beaten like this!");
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "‘Sign up’? I thought you didn’t remember anything.");
+-
+-	FACE(kurumi, tsun_blush);
+-	MSG(kurumi, "N-Nevermind!");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -366,162 +78,19 @@ DIALOG_TASK(marisa, Stage4PostBoss) {
+ 
+ DIALOG_TASK(marisa, Stage5PreBoss) {
+ 	DIALOG_BEGIN(Stage5PreBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(iku);
+-	HIDE(iku);
+-
+-	FACE(marisa, inquisitive);
+-	MSG(marisa, "This place is fascinatin’!");
+-	MSG(marisa, "I gotta tell Nitori!");
+-
+ 	EVENT(boss_appears);
+-	MSG(iku, "I would not recommend getting too enamoured, young witch.");
+-	SHOW(iku);
+-	MSG(iku, "I’m surprised to see you here. How have you been?");
+-
+-	MSG(marisa, "What grimoire would this be in…?");
+-	MSG(marisa, "Hmm… probably a major illusion of some kind…?");
+-	MSG(marisa, "That’d be easier than making the bricks weightless, ‘n it’s a good disguise…");
+-
+-	TITLE_IKU(iku);
+-	FACE(iku, smile);
+-	MSG(iku, "… pardon me, are you conversing with yourself?");
+-
+-	FACE(marisa, normal);
+-	MSG(marisa, "Huh? No, I was askin’ ya a question.");
+-
+-	MSG(iku, "An interesting theory, I suppose.");
+-
+-	MSG(marisa, "It’d make sense though, right?");
+-	FACE(marisa, inquisitive);
+-	MSG(marisa, "It appeared outta nowhere. If it were real brick, the air displacement alone woulda caused a huge noise…");
+-	MSG(marisa, "And it’d take so much power, too.");
+-	MSG(marisa, "Definitely an illusion, then.");
+-
+-	MSG(iku, "The premise of your theory is flawed, unfortunately.");
+-	FACE(iku, eyes_closed);
+-	FACE(marisa, normal);
+-	MSG(iku, "The technology on display here is beyond our current comprehension.");
+-
+-	FACE(marisa, surprised);
+-	MSG(marisa, "Technology? Whoa, so yer sayin’ this is REAL brick?!");
+-	FACE(marisa, normal);
+-	MSG(marisa, "*tap tap*");
+-	FACE(marisa, surprised);
+-	MSG(marisa, "It’s so cold it’s almost creepy, like it was suckin’ magic right outta my fingers.");
+-	FACE(marisa, inquisitive);
+-	MSG(marisa, "But that means the tower… has corporeal form?!");
+-	MSG(marisa, "Dang! Now I GOTTA meet the owner!");
+-	MSG(marisa, "What grimoires does she got to pull somethin’ like this off?!");
+-
+-	FACE(iku, smile);
+-	MSG(iku, "I-I would imagine she does not use grimoires, or magic.");
+-	FACE(iku, serious);
+-	MSG(iku, "This is highly complex machinery, likely relying on advanced computational—");
+-
+-	MSG(marisa, "But then, what’s the power source?");
+-	MSG(marisa, "Not even nuclear fusion could sustain somethin’ like this!");
+-
+-	FACE(iku, smile);
+-	MSG(iku, "I-I am not sure of its exact mechanics—");
+-
+-	FACE(marisa, happy);
+-	MSG(marisa, "Where’d y’say she was?");
+-
+-	FACE(iku, normal);
+-	MSG(iku, "You mean…?");
+-
+-	FACE(marisa, inquisitive);
+-	MSG(marisa, "The owner, o’ course! Upstairs, right?");
+-
+-	FACE(iku, serious);
+-	MSG(iku, "Perhaps the thin atmosphere at this elevation has gotten to you. I will not divulge any further information, for your own protection.");
+-
+-	FACE(marisa, happy);
+-	MSG(marisa, "What’s her name?");
+-
+-	MSG(iku, "Why are you not listening to me…?");
+-
+-	FACE(marisa, inquisitive);
+-	MSG(marisa, "Do ya got any tips on talkin’ to her, maybe make her loosen up a bit?");
+-	FACE(marisa, happy);
+-	MSG(marisa, "I don’t wanna blow my chance.");
+-
+-	FACE(iku, smile);
+-	MSG(iku, "I am trying to spare you further peril, yet all you can do is talk over me. Be more considerate.");
+-	MSG(iku, "I had expectations that you would be able to approach this with a clear head and resolve this incident, but it seems—");
+-
+-	FACE(marisa, normal);
+-	MSG(marisa, "Ah, I see, I see. I’ll have to turn on the ol’ Kirisame charm.");
+-	FACE(marisa, smug);
+-	FACE(iku, serious);
+-	MSG(marisa, "I get it, I get it.");
+-	MSG(marisa, "Haven’t done ‘femme fatale’ in a while, but…");
+-
+ 	EVENT(music_changes);
+-
+-	MSG(iku, "Enough!");
+-	MSG(iku, "It is said that specifically applied electro-stimulation can ease the mind.");
+-	FACE(iku, eyes_closed);
+-	MSG(iku, "Allow me to put that into practice for you!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(marisa, Stage5PostMidBoss) {
+ 	DIALOG_BEGIN(Stage5PostMidBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	FACE(marisa, surprised);
+-
+ 	// should be only one message with a fixed 180-frame (3 second) timeout
+-	MSG_UNSKIPPABLE(marisa, 180, "So this place runs on electricity, eh? Hmm…");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(marisa, Stage5PostBoss) {
+ 	DIALOG_BEGIN(Stage5PostBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(iku);
+-	VARIANT(iku, defeated);
+-	FACE(iku, defeated);
+-
+-	FACE(marisa, unamused);
+-	MSG(marisa, "Oof, I hope that didn’t make my hair too frizzy.");
+-	FACE(marisa, happy);
+-	MSG(marisa, "Y’know, for my big first impression ‘n all.");
+-
+-	FACE(iku, eyes_closed);
+-	MSG(iku, "F-For the last time, she’ll have nothing to teach you…");
+-	MSG(iku, "Her powers rely on technology and the scientific method. Of that much, I am sure.");
+-
+-	FACE(marisa, unamused);
+-	MSG(marisa, "The one time Sanae’s not around to geek out about all the sciencey stuff, eh?");
+-	FACE(iku, normal);
+-	FACE(marisa, normal);
+-	MSG(marisa, "Ah well, I know how to operate one of those Intelligent Phones, and that’s plenty advanced, so I should be fine.");
+-	FACE(marisa, inquisitive);
+-	MSG(marisa, "By the way, have ya been hearing that strange voice?");
+-
+-	MSG(iku, "Strange voice?");
+-
+-	FACE(marisa, smug);
+-	MSG(marisa, "Yeah, it keeps tellin’ me that I’m not thinkin’ straight or whatever.");
+-	MSG(marisa, "Probably just those weird madness rays tryin’ to get me.");
+-
+-	FACE(iku, eyes_closed);
+-	MSG(iku, "Ugh, you fool.");
+-	FACE(iku, normal);
+-	MSG(iku, "But perhaps you are thinking just well enough to resolve this incident after all…");
+-
+-	FACE(marisa, surprised);
+-	MSG(marisa, "Ah! There’s that voice again!");
+-	FACE(marisa, smug);
+-	MSG(marisa, "So strange…");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -531,135 +100,13 @@ DIALOG_TASK(marisa, Stage5PostBoss) {
+ 
+ DIALOG_TASK(marisa, Stage6PreBoss) {
+ 	DIALOG_BEGIN(Stage6PreBoss);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(elly);
+-	HIDE(elly);
+-
+ 	EVENT(boss_appears);
+-	MSG(elly, "I’ve been waiting for you to make your move.");
+-	SHOW(elly);
+-	MSG(elly, "Sneaking around as you are, and yet still so loud somehow.");
+-
+-	FACE(marisa, puzzled);
+-	MSG(marisa, "Hmm…");
+-
+-	FACE(elly, smug);
+-	MSG(elly, "Did you really think I wouldn’t notice all the commotion you caused inside the tower?");
+-
+-	MSG(marisa, "Hmmmmmmm…");
+-
+-	FACE(elly, angry);
+-	MSG(elly, "Stop being an insolent brat and speak up!");
+-
+-	FACE(marisa, unamused);
+-	MSG(marisa, "… sigh.");
+-
+-	FACE(elly, normal);
+-	MSG(elly, "… w-what is it?");
+-
+-	MSG(marisa, "Ya don’t look like a magician after all.");
+-	MSG(marisa, "I’m pretty disappointed.");
+-	MSG(marisa, "Honestly, this might be the most disappointing incident yet.");
+-
+-	TITLE_ELLY(elly);
+-	MSG(elly, "You’re after… magic?");
+-	FACE(elly, smug);
+-	MSG(elly, "Hah! You’ll regret wasting your time on such nonsense.");
+-	MSG(elly, "Soon, you’ll see the error of—");
+-
+-	MSG(marisa, "Do ya know how boring it is to be a magician in Gensōkyō these days?");
+-
+-	FACE(elly, eyes_closed);
+-	MSG(elly, "I couldn’t possibly care about—");
+-
+-	MSG(marisa, "Seriously! Recently it’s just been ‘God this’ and ‘Otherworld that’.");
+-	MSG(marisa, "Reimu’s been pickin’ up some sweet skills, but me? Nothin’!");
+-	MSG(marisa, "Gods use magic too, but they’re like her! They don’t need books!");
+-	MSG(marisa, "But I do! And I end up empty handed every dang time!");
+-
+-	FACE(elly, angry);
+-	MSG(elly, "I SAID I don’t CARE about your stupid little sorc—");
+-
+-	MSG(marisa, "I saw this place ‘n I was all, ‘Whoa! Is this all enchantments ‘n stuff?!’");
+-	FACE(marisa, inquisitive);
+-	MSG(marisa, "I got really excited!");
+-	MSG(marisa, "‘Maybe I could get a new trump-card outta this’ is what I thought.");
+-	FACE(marisa, unamused);
+-	MSG(marisa, "But obviously yer a shinigami or somethin’. And I didn’t see a library…");
+-	MSG(marisa, "I guess that oarfish from before was right.");
+-	MSG(marisa, "Master Spark’s good ‘n all, but it’ll only get me so far in life…");
+-
+-	FACE(elly, eyes_closed);
+-	MSG(elly, "…");
+-	MSG(marisa, "*sigh*");
+-	MSG(elly, "Are you finally done?");
+-	FACE(elly, angry);
+-	MSG(elly, "Is this some kind of joke?!");
+-	FACE(elly, shouting);
+-	MSG(elly, "How does every version of you just keep mocking me?!");
+-
+-	MSG(marisa, "What, you mean last time? At least then you were guardin’ some powerful thingy I coulda used.");
+-	MSG(marisa, "I’m tryin’ to remember, was that timeline a bust, too?");
+-	FACE(marisa, happy);
+-	MSG(marisa, "At least I met Yūka, right? Did ya know she ended up givin’ me my trademark spell?");
+-	MSG(marisa, "Not right then, ‘n not voluntarily, but—");
+-
+-	FACE(elly, angry);
+-	MSG(elly, "Y-you remember that?! But how—?!");
+-	MSG(elly, "… ugh, nevermind! It’s not as if you could possibly grasp the Tower’s true power.");
+-	FACE(elly, smug);
+-	MSG(elly, "After all, I can already sense your feeble mind succumbing to its might!");
+-
+-	FACE(marisa, unamused);
+-	MSG(marisa, "Eh? I’m not depressed or anythin’. I’m just disappointed.");
+-
+-	FACE(elly, shouting);
+-	MSG(elly, "I-It’s not about being ‘depressed’! It’s about being overwhelmed with the vast knowledge of the universe!");
+-	MSG(elly, "Once you realize the true potential of reality, you’ll go mad with knowledge!");
+-	MSG(elly, "Don’t you see?! Nothing can stop us now! For we are—!");
+-
+-	FACE(marisa, surprised);
+-	MSG(marisa, "But I’m already mad with knowledge! Why do ya think I drink all the time?!");
+-	MSG(marisa, "My mind’s always racin’ with this ‘n that…");
+-	MSG(marisa, "Ya think this is any different than how I usually live?! Get over y’erself!");
+-	FACE(marisa, inquisitive);
+-	MSG(marisa, "Now, I gotta ask… ya really, seriously don’t got anything?");
+-	MSG(marisa, "A single bookshelf?! A few loose scribbled notes?!");
+-	MSG(marisa, "Heck, I’ll even take one of those little glowy tablet thingies with all those ‘Pee Dee Effs’ on ‘em! They're so bright they hurt my eyes, but—");
+-
+-	FACE(elly, eyes_closed);
+-	MSG(elly, "Since you’re OBVIOUSLY treating this as a joke, I REFUSE to speak with you any longer!");
+-
+-	FACE(marisa, happy);
+-	MSG(marisa, "Oh c’mon, turn the madness-whatever off ‘n we’ll go out for drinks! There’s this nice new bar in town with a cute—");
+-
+-	MSG(elly, "There’s no force in this world that would make me turn back now!");
+ 	EVENT(music_changes);
+-	FACE(elly, smug);
+-	MSG(elly, "Someone as ‘ordinary’ as you getting in our way may be impressive…");
+-	FACE(elly, angry);
+-	MSG(elly, "But there’s no place for sorcery in our enlightened vision of Gensōkyō!");
+-	FACE(elly, shouting);
+-	MSG(elly, "Now, succumb to the madness!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(marisa, Stage6PreFinal) {
+ 	DIALOG_BEGIN(Stage6PreFinal);
+-
+-	ACTOR_LEFT(marisa);
+-	ACTOR_RIGHT(elly);
+-	VARIANT(elly, beaten);
+-	FACE(elly, normal);
+-	FACE(marisa, unamused);
+-	MSG(marisa, "Are ya sure ya don’t got a spellbook laying around?! Nothin’ at all?!");
+-	FACE(elly, angry);
+-	MSG(elly, "Are you still on about that?! Fine, see what good it does you!");
+-	FACE(elly, shouting);
+-	MSG(elly, "Your pitiful magic amounts to nothing against the true nature of reality!");
+-
+ 	DIALOG_END();
+ }
+ 
+diff --git a/src/dialog/reimu.c b/src/dialog/reimu.c
+index 768d35ac..c43802b9 100644
+--- a/src/dialog/reimu.c
++++ b/src/dialog/reimu.c
+@@ -13,85 +13,18 @@
+  */
+ 
+ DIALOG_TASK(reimu, Stage1PreBoss) {
+-	PRELOAD {
+-		PRELOAD_CHAR(reimu) {
+-			PRELOAD_FACE(normal);
+-			PRELOAD_FACE(unamused);
+-			PRELOAD_FACE(sigh);
+-		}
+-
+-		PRELOAD_CHAR(cirno) {
+-			PRELOAD_FACE(normal);
+-			PRELOAD_FACE(angry);
+-		}
+-	}
+-
+ 	// Initialization, must be at the very top (after PRELOAD).
+ 	DIALOG_BEGIN(Stage1PreBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(cirno);
+-
+-	// Hide cirno for now, to be revealed later.
+-	HIDE(cirno);
+-
+-	// Let’s wait a bit, then change Reimu’s expression.
+-	// All timings are in frames (60 = 1 sec).
+-	WAIT_SKIPPABLE(60);
+-	// "normal" is the default face.
+-	FACE(reimu, sigh);
+-
+-	// MSG() makes the actor say a line, and then waits an unspecified amount of time (skippable).
+-	// The timeout is determined by the dialog_util_estimate_wait_timeout_from_text() function in dialog.c
+-	MSG(reimu, "Snow during summer? This is certainly familiar…");
+-
+ 	// EVENT()s are handled by stage code.
+ 	// You can find the list of events per dialogue in dialog_interface.h
+ 	// All of them should be signaled eventually.
+ 	EVENT(boss_appears);
+-	MSG(cirno, "Nobody can stop me now!");
+-	// Reveal Cirno’s portrait
+-	SHOW(cirno);
+-	FACE(cirno, normal);
+-	MSG(cirno, "Mwahahaha!");
+-
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "What’s gotten into you all of a sudden?");
+-	// Titles are not yet implemented, but this should work once they are.
+-	// Right now this does nothing.
+-	TITLE_CIRNO(cirno);
+-	MSG(cirno, "Gah! Y-you again?! Are you here to get in the way of my plans?!");
+-
+-	MSG(reimu, "What ‘plans'? Freezing frogs?");
+-	FACE(reimu, sigh);
+-	MSG(reimu, "Anyway, I don’t really care. So if you could just—");
+ 	EVENT(music_changes);
+-
+-	FACE(reimu, annoyed);
+-	MSG(cirno, "I’ll never tell you! Prepare to be chilled to the bone!");
+-	// Teardown, must be at the very bottom.
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(reimu, Stage1PostBoss) {
+ 	DIALOG_BEGIN(Stage1PostBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(cirno);
+-
+-	// VARIANT() changes the base body sprite.
+-	// Bosses currently only have a "defeated" variant with some clothing damage, to be used in post-battle scenes.
+-	// Elly’s is called "beaten" and is slightly subdued.
+-	VARIANT(cirno, defeated);
+-
+-	// Bosses also have a "defeated" face to go along with the variant, but all the other faces can be used as well.
+-	// It’s best to set the face to "defeated" in the beginning of a post-battle dialogue, and change it later if needed.
+-	FACE(cirno, defeated);
+-	MSG(cirno, "Chill out! I didn’t mean it like that!");
+-	FACE(reimu, smug);
+-	MSG(reimu, "You could have just let me through, you know.");
+-	MSG(cirno, "Not fair! You broke the rules! I wasn’t ready yet…");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -101,76 +34,13 @@ DIALOG_TASK(reimu, Stage1PostBoss) {
+ 
+ DIALOG_TASK(reimu, Stage2PreBoss) {
+ 	DIALOG_BEGIN(Stage2PreBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(hina);
+-
+-	HIDE(hina);
+-	WAIT_SKIPPABLE(60);
+-
+-	FACE(reimu, normal);
+-	MSG(reimu, "With those loudmouthed kappa gone, the mountain feels practically deserted.");
+-	FACE(reimu, sigh);
+-	MSG(reimu, "I almost miss them.");
+-
+ 	EVENT(boss_appears);
+-	MSG(hina, "Ah, it’s Ms. Hakurei.");
+-	SHOW(hina);
+-	FACE(reimu, normal);
+-	FACE(hina, normal);
+-	MSG(hina, "I thought you might come.");
+-	FACE(hina, concerned);
+-	MSG(hina, "But once again, you’re trying to go places you shouldn’t.");
+-	MSG(hina, "What a troubled girl…");
+-
+-	FACE(reimu, sigh);
+-	MSG(reimu, "So much for ‘deserted’…");
+-	FACE(reimu, normal);
+-	MSG(reimu, "Do you even know what you’re protecting me from this time?");
+-
+-	TITLE_HINA(hina);
+-
+-	FACE(hina, normal);
+-	MSG(hina, "A bright girl like you should know that Yōkai Mountain is especially dangerous today.");
+-	FACE(hina, concerned);
+-	MSG(hina, "You ought to turn back now, my dear.");
+-
+-	FACE(reimu, sigh);
+-	MSG(reimu, "(She… she completely ignored my question.)");
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "Does it matter that the Gods asked me to come this time?");
+-
+ 	EVENT(music_changes);
+-
+-	MSG(hina, "I know better than the mountain Gods this time.");
+-	MSG(hina, "If you do not turn back immediately, I’ll have to repel you by force.");
+-
+-	FACE(reimu, sigh);
+-	MSG(reimu, "So annoying…");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(reimu, Stage2PostBoss) {
+ 	DIALOG_BEGIN(Stage2PostBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(hina);
+-
+-	WAIT_SKIPPABLE(30);
+-
+-	VARIANT(hina, defeated);
+-	FACE(hina, defeated);
+-	FACE(reimu, normal);
+-
+-	MSG(hina, "So I lost… you can keep going then, I suppose.");
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "You should know by now that I can handle it. Why are you being so overbearing?");
+-	MSG(hina, "Just don’t say I didn’t warn you, when you inevitably get mauled by whatever’s out there…");
+-
+-	FACE(reimu, unamused);
+-	MSG(reimu, "(Ignored again…)");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -180,74 +50,13 @@ DIALOG_TASK(reimu, Stage2PostBoss) {
+ 
+ DIALOG_TASK(reimu, Stage3PreBoss) {
+ 	DIALOG_BEGIN(Stage3PreBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(wriggle);
+-	HIDE(wriggle);
+-	FACE(reimu, normal);
+-	MSG(reimu, "Aside from everyone being whipped up into a frenzy, I can’t see anything abnormal yet.");
+-
+ 	EVENT(boss_appears);
+-	MSG(wriggle, "Well, to your human eyes, insects may seem ‘normal’…");
+-
+-	SHOW(wriggle);
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "… but there was a time when we reigned supreme!");
+-
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "Eh? You? Aren’t you a bit far from home?");
+-	MSG(reimu, "Besides, ‘reigned supreme’? I’ve never heard of insects ruling over Gensōkyō.");
+-
+-	TITLE_WRIGGLE(wriggle);
+-	FACE(wriggle, outraged);
+-	MSG(wriggle, "'Far from home'? But you’ve intruded on my secret lair!");
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "Haven’t you heard of the Car—…");
+-	MSG(wriggle, "Carb—…");
+-	FACE(reimu, puzzled);
+-	MSG(wriggle, "That period of history?");
+-	MSG(wriggle, "It was the greatest time, everyone should’ve heard of it by now!");
+-
+-	MSG(reimu, "Seems pretty far-fetched to me, honestly. But you yōkai are always coming up with the craziest theories…");
+-
+-	FACE(wriggle, outraged);
+-	MSG(wriggle, "Don’t lump us great insects in with common yōkai!");
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "I’m going to restore us to our rightful glory of old!");
+-
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "Giant insects? But you’re tiny.");
+-	FACE(reimu, unamused);
+-	MSG(reimu, "And I still don’t know what you mean by ‘glory of old.’");
+-
+ 	EVENT(music_changes);
+-
+-	MSG(wriggle, "You don’t seem very educated about our history.");
+-	MSG(wriggle, "Allow me to be your teacher!");
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(reimu, Stage3PostBoss) {
+ 	DIALOG_BEGIN(Stage3PostBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(wriggle);
+-
+-	VARIANT(wriggle, defeated);
+-	FACE(wriggle, defeated);
+-
+-	FACE(reimu, smug);
+-	MSG(reimu, "Giant insects roaming Gensōkyō, huh?");
+-	MSG(reimu, "Sounds like one of Sanae’s ‘nuclear’ experiments.");
+-
+-	MSG(wriggle, "B-but I saw it clearly… the glorious past of insectkind…");
+-
+-	FACE(reimu, unamused);
+-	MSG(reimu, "Don’t you have a pretty sweet deal as it is, though?");
+-	MSG(reimu, "You practically own Gensōkyō’s forests.");
+-
+-	MSG(wriggle, "But can’t we ever hope for more…?");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -257,125 +66,13 @@ DIALOG_TASK(reimu, Stage3PostBoss) {
+ 
+ DIALOG_TASK(reimu, Stage4PreBoss) {
+ 	DIALOG_BEGIN(Stage4PreBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(kurumi);
+-
+-	HIDE(kurumi);
+-
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "Huh? There’s a mansion jutting out of this tower?");
+-	FACE(reimu, sigh);
+-	MSG(reimu, "This makes even less sense than usual.");
+-
+ 	EVENT(boss_appears);
+-	WAIT_SKIPPABLE(30);
+-
+-	FACE(reimu, normal);
+-	MSG(reimu, "And who are you supposed to be?");
+-
+-	SHOW(kurumi);
+-	FACE(kurumi, tsun);
+-	MSG(kurumi, "Oi, that’s what I should be asking!");
+-
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "…?");
+-	FACE(reimu, unamused);
+-	MSG(reimu, "And what are you doing, anyways?");
+-	MSG(reimu, "Are you behind all these… strange thoughts everyone’s having?");
+-
+-	FACE(kurumi, normal);
+-	TITLE_KURUMI(kurumi);
+-	MSG(kurumi, "I have no idea what you mean by ‘strange thoughts’, but I’ll be honest with you…");
+-	MSG(kurumi, "Your clothing is giving me some strange thoughts!");
+-	MSG(kurumi, "Where’d you even get that outfit?! Dumpster diving?! For real!");
+-
+-	FACE(reimu, unamused);
+-	MSG(reimu, "Ugh, another prissy mansion-dweller.");
+-	FACE(reimu, sigh);
+-	MSG(reimu, "I thought I remembered you from somewhere, but no. Absolutely not.");
+-	FACE(reimu, assertive);
+-	MSG(reimu, "Just… stop whatever it is you’re doing, right now.");
+-
+-	FACE(kurumi, dissatisfied);
+-	MSG(kurumi, "Once you get some fashion sense, maybe I will!");
+-
+-	FACE(reimu, unamused);
+-	MSG(reimu, "… so you *are* behind this, huh?");
+-	FACE(reimu, sigh);
+-	MSG(reimu, "Besides, haven’t you ever seen a shrine maiden before?");
+-
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "You’re a shrine maiden?");
+-	FACE(reimu, unamused);
+-	MSG(kurumi, "More like… BRINE maiden!");
+-
+-	FACE(reimu, assertive);
+-	MSG(reimu, "T-this is what a shrine maiden wears. It’s a uniform.");
+-
+-	MSG(kurumi, "Uniform? Are you kidding me?!");
+-	MSG(kurumi, "I’ve seen a real shrine maiden before, and she didn’t look anything like you!");
+-	MSG(kurumi, "What’s with those patterns, anyways? It’s completely unorthodox! It’s not even using the right type of fabric!");
+-	FACE(kurumi, tsun);
+-	MSG(kurumi, "Get out of here, fake-maiden!");
+-
+-	FACE(reimu, irritated);
+-	MSG(reimu, "… ARGH!");
+-	FACE(reimu, outraged);
+-	MSG(reimu, "Listen!! It’s HARD to find clothes I can wear every day on the job!");
+-	MSG(reimu, "It has to fit a certain style!");
+-	MSG(reimu, "And only a few fabrics feel good to wear!");
+-	MSG(reimu, "I can’t stand scratchy wool or slippery silk!");
+-	MSG(reimu, "Everything else feels terrible against my skin—");
+-	FACE(reimu, irritated);
+-
+-	MSG(kurumi, "Whoa, hey, sorry, didn’t mean to make you all—");
+-
+ 	EVENT(music_changes);
+-
+-	MSG(reimu, "I *hate* prissy mansion dwellers!");
+-	FACE(reimu, outraged);
+-	MSG(reimu, "Let’s just get this over with!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(reimu, Stage4PostBoss) {
+ 	DIALOG_BEGIN(Stage4PostBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(kurumi);
+-	VARIANT(kurumi, defeated);
+-	FACE(kurumi, defeated);
+-
+-	FACE(reimu, irritated);
+-	MSG(reimu, "That’s what you get for insulting my outfit like that.");
+-
+-	MSG(kurumi, "Ouch ouch ouch…");
+-	MSG(kurumi, "W-wait, what happened?");
+-
+-	MSG(reimu, "What do you mean ‘what happened’?");
+-
+-	MSG(kurumi, "(M-maybe if I fake having amnesia… yeah, that’s it…!)");
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "O-oof, my head! Ow! How did I even get here???");
+-	MSG(kurumi, "W-wait! Aren’t you that girl from a long while back?");
+-
+-	FACE(reimu, sigh);
+-	MSG(reimu, "I don’t remember you at all.");
+-	FACE(reimu, unsettled);
+-	MSG(reimu, "But somehow, so familiar…");
+-	FACE(reimu, sigh);
+-	MSG(reimu, "This feeling is annoying, whatever it is. Make it stop, or tell me how to make it stop.");
+-
+-	FACE(kurumi, defeated);
+-	MSG(kurumi, "Huh? I-I don’t know! I barely remember anything!");
+-	MSG(kurumi, "(Ugh, her outfit really does suck though…)");
+-
+-	MSG(reimu, "(Just another victim…?)");
+-	FACE(reimu, normal);
+-	MSG(reimu, "I’ll deal with you after I figure out whatever's happening here.");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -385,141 +82,21 @@ DIALOG_TASK(reimu, Stage4PostBoss) {
+ 
+ DIALOG_TASK(reimu, Stage5PreBoss) {
+ 	DIALOG_BEGIN(Stage5PreBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(iku);
+-	HIDE(iku);
+-
+-	FACE(reimu, unsettled);
+-	MSG(reimu, "I’ve got a bad feeling about this…");
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "Or maybe I’m just feeling nauseous with this tower’s constant spinning.");
+-
+ 	EVENT(boss_appears);
+-	WAIT_SKIPPABLE(60);
+-	SHOW(iku);
+-	FACE(iku, normal);
+-	MSG(iku, "Or perchance it a side effect of the tower’s mere presence?");
+-
+-	MSG(reimu, "Oh, it’s you. Why did you attack me earlier, anyway?");
+-
+-	TITLE_IKU(iku);
+-	FACE(iku, smile);
+-	MSG(iku, "Ah, apologies. It must have been friendly fire.");
+-	FACE(iku, eyes_closed);
+-	MSG(iku, "Things are quite hectic here. I beg your understanding.");
+-	MSG(iku, "But it has been a while, has it not?");
+-
+-	FACE(reimu, normal);
+-	MSG(reimu, "Err, right, yes, it has been a while. Nice to see you again.");
+-
+-	FACE(iku, serious);
+-	MSG(iku, "This tower is unlike anything I have seen before.");
+-	MSG(iku, "Since word spread through the clouds, I’ve learned that the culprit is connected to ‘parallel universes.’");
+-
+-	FACE(reimu, puzzled);
+-	MSG(reimu, "You mean like Otherworlds? That’s not too out of the ordinary these days.");
+-	FACE(reimu, unsettled);
+-	MSG(reimu, "This feels different though. It’s like the walls are sucking up faith into a void.");
+-	MSG(reimu, "I’m surprised the fairies are surviving at all…");
+-	FACE(reimu, normal);
+-	MSG(reimu, "But what are you even doing here?");
+-
+-	FACE(iku, eyes_closed);
+-	MSG(iku, "It is not just the Netherworld and Gensōkyō being affected.");
+-	FACE(iku, serious);
+-	MSG(iku, "In Bhava-agra, the Eldest Daughter’s personality has experienced some changes, too.");
+-
+-	FACE(reimu, surprised);
+-	MSG(reimu, "It’s spreading that fast?!");
+-
+-	FACE(iku, smile);
+-	MSG(iku, "Initially, I had no plans towards interfering.");
+-	FACE(reimu, normal);
+-	FACE(iku, serious);
+-	MSG(iku, "However, the tower’s psychological effects began to intensify, and I began to fear that nobody would take charge.");
+-
+-	FACE(reimu, sigh);
+-	MSG(reimu, "(Do people have this little faith in me…?)");
+-
+-	FACE(iku, eyes_closed);
+-	MSG(iku, "As more minds began to fall prey, I considered a theory…");
+-	FACE(reimu, normal);
+-	MSG(iku, "Is this machine incompatible with the existence of fantasy?");
+-	FACE(iku, normal);
+-	MSG(iku, "That may be why you feel a sense of dread about the place.");
+-
+-	FACE(reimu, normal);
+-	MSG(reimu, "Well, that settles it. Where’s the owner, then?");
+-
+-	FACE(iku, smile);
+-	MSG(iku, "To be frank, I am not sure whether you are up to the task.");
+-	MSG(iku, "You are still relatively composed, yes, but your mental state seems to be deteriorating.");
+-
+-	FACE(reimu, irritated);
+-	MSG(reimu, "Deteriorating? But I just got here!");
+-
+ 	EVENT(music_changes);
+-	MSG(iku, "You are still so worrisome. You ought to go home before you lose yourself.");
+-
+-	FACE(reimu, irritated);
+-	MSG(reimu, "No!");
+-
+-	FACE(iku, serious);
+-	MSG(iku, "I beg your pardon?");
+-
+-	MSG(reimu, "Don’t keep telling me how little you think of me. I’m sick of it!");
+-	FACE(reimu, assertive);
+-	MSG(reimu, "I’m going to give everyone a reason to have faith in me!");
+-
+-	MSG(iku, "It seems your resolve is unwavering. Very well, then.");
+-	MSG(iku, "Allow me to test your resistance to their infuriating machine!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(reimu, Stage5PostMidBoss) {
+ 	DIALOG_BEGIN(Stage5PostMidBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	FACE(reimu, surprised);
+-
+ 	// should be only one message with a fixed 120-frames timeout
+-	// UNSKIPPABLE is required here to keep music in sync
+-	MSG_UNSKIPPABLE(reimu, 120, "Thunder clouds? Are we really that high up?");
+-
++	// UNSKIPPABLE is required here to keep music in sync.
++	// but since the music are changed anyway just delete you lol
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(reimu, Stage5PostBoss) {
+ 	DIALOG_BEGIN(Stage5PostBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(iku);
+-	VARIANT(iku, defeated);
+-	FACE(iku, defeated);
+-
+-	MSG(iku, "Ah…");
+-	MSG(iku, "I was wrong for doubting you, I suppose…");
+-
+-	FACE(reimu, unamused);
+-	MSG(reimu, "Somehow I don’t feel too satisfied by that.");
+-
+-	FACE(iku, eyes_closed);
+-	MSG(iku, "To be honest with you, I’m glad you arrived after all.");
+-	MSG(iku, "I know now that I would not have been able to defeat her.");
+-	FACE(reimu, normal);
+-	MSG(iku, "Since you’re still able to think clearly, perhaps Gensōkyō will be saved after all.");
+-
+-	FACE(reimu, sigh);
+-	MSG(reimu, "Finally.");
+-	FACE(reimu, normal);
+-	MSG(reimu, "But you’re right. This is bigger than Gensōkyō.");
+-	MSG(reimu, "I’ll need to take this seriously.");
+-
+-	FACE(iku, normal);
+-	MSG(iku, "Glad to hear it.");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -529,117 +106,13 @@ DIALOG_TASK(reimu, Stage5PostBoss) {
+ 
+ DIALOG_TASK(reimu, Stage6PreBoss) {
+ 	DIALOG_BEGIN(Stage6PreBoss);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(elly);
+-	HIDE(elly);
+ 	EVENT(boss_appears);
+-	MSG(elly, "Well, well, well. It seems a faithful rat trespassed on our domain.");
+-	SHOW(elly);
+-
+-	FACE(elly, smug);
+-	MSG(elly, "How strange. You should’ve lost your mind by now.");
+-
+-	FACE(reimu, unsettled);
+-	MSG(reimu, "Just turn it off already.");
+-	MSG(reimu, "I’m not in the mood to argue, so don’t push me!");
+-
+-	TITLE_ELLY(elly);
+-	FACE(elly, angry);
+-	MSG(elly, "Bold of you to barge into MY tower and give ME orders!");
+-	MSG(elly, "I still remember what you did to Lady Kazami and I back then!");
+-
+-	FACE(reimu, sigh);
+-	MSG(reimu, "And what was that, again?");
+-	MSG(reimu, "I’m getting a familiar feeling just looking at you, but…");
+-
+-	FACE(elly, shouting);
+-	MSG(elly, "Is this a joke?! Are you trying to mock me?!");
+-
+-	FACE(reimu, assertive);
+-	MSG(reimu, "I think I would’ve remembered a giant tower that makes people go mad with power!");
+-	MSG(reimu, "The least you can do when accusing someone is to tell them what they’ve supposedly done!");
+-
+-	FACE(elly, smug);
+-	MSG(elly, "Ah. I see.");
+-	FACE(elly, normal);
+-	MSG(elly, "Fine. I will.");
+-	FACE(reimu, unamused);
+-	MSG(elly, "This tower is a recent invention. Its mere existence is revolutionary in several scientific fields.");
+-	MSG(elly, "The denizens of this Gensōkyō ought to have been thankful for its vast scientific knowledge…");
+-	MSG(elly, "But alas, we have other plans.");
+-
+-	FACE(reimu, unsettled);
+-	MSG(reimu, "‘This’ Gensōkyō…?");
+-
+-	FACE(reimu, unamused);
+-	MSG(reimu, "Somehow, it feels like more of a punishment.");
+-	MSG(reimu, "Ever heard of ‘ignorance is bliss’?");
+-	MSG(reimu, "There won’t be anyone to rule over, or whatever, if you make them all lose it.");
+-
+-	MSG(elly, "The Tower of Babel is capable of ‘enlightening’ those fortunate to be around it.");
+-	FACE(elly, smug);
+-	MSG(elly, "Anyone unable to comprehend its brilliance will be driven to madness.");
+-	FACE(elly, shouting);
+-	MSG(elly, "But this is simply retribution for the crimes that have been committed against us!");
+-
+-	FACE(reimu, unsettled);
+-	MSG(reimu, "‘Parallel universes’, is that it?");
+-
+-	FACE(elly, normal);
+-	MSG(elly, "Hmm? Is that what you think this Gensōkyō is?");
+-
+-	FACE(reimu, irritated);
+-	MSG(reimu, "You tell me! You’re the megalomaniac!");
+-	FACE(reimu, assertive);
+-	MSG(reimu, "Do you hate me because some other Reimu did something? Is that it?");
+-	MSG(reimu, "But then what does that have to do with any of us?!");
+-	FACE(reimu, irritated);
+-	MSG(reimu, "For a ‘scientist’, you’re not making a whole lot of sense!");
+-
+-	FACE(elly, angry);
+-	MSG(elly, "Perhaps you’ve simply forgotten, like you have of the rest of us!");
+-	FACE(reimu, unamused);
+-	MSG(elly, "Only the privileged, such as Lady Kazami, made it out! The rest of us were lost!");
+-
+-	FACE(reimu, unsettled);
+-	MSG(reimu, "You mean Kazami Yūka? And I suppose… Alice, too?");
+-	MSG(reimu, "I remember when I first met Alice, and she said some weird things too, just like you are now.");
+-	FACE(reimu, unamused);
+-	MSG(reimu, "But she didn’t go around threatening everyone!");
+-
+-	FACE(elly, angry);
+-	MSG(elly, "We weren’t as lucky! And as reparation, we will take control of this Gensōkyō!");
+-	MSG(elly, "We will make it so we will NEVER be forgotten!");
+-
+-	FACE(reimu, sigh);
+-	MSG(reimu, "Even in Gensōkyō, you can be forgotten, huh?");
+-	MSG(reimu, "What a miserable thought. No wonder I felt terrible just seeing this place!");
+-	FACE(reimu, assertive);
+-	MSG(reimu, "Turn it off, or being forgotten will be the least of your worries!");
+-
+ 	EVENT(music_changes);
+-	FACE(elly, shouting);
+-	MSG(elly, "It’s too late for that! Soon, all of Gensōkyō will become enlightened!");
+-	FACE(reimu, unsettled);
+-	MSG(elly, "Don’t you understand, pitiful shrine maiden? Science is an unfathomable power, surpassed by nothing!");
+-	MSG(elly, "We won’t be forgotten again!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(reimu, Stage6PreFinal) {
+ 	DIALOG_BEGIN(Stage6PreFinal);
+-
+-	ACTOR_LEFT(reimu);
+-	ACTOR_RIGHT(elly);
+-	VARIANT(elly, beaten);
+-	FACE(elly, shouting);
+-	FACE(reimu, assertive);
+-	MSG(reimu, "Is that it? Are you finally done?");
+-	MSG(elly, "Y-you think this is over?! The time of reckoning is upon you!");
+-	MSG(elly, "Gaze upon the ultimate truth of the universe, and tremble!");
+-
+ 	DIALOG_END();
+ }
+ 
+diff --git a/src/dialog/youmu.c b/src/dialog/youmu.c
+index 320a2b98..a59d0b93 100644
+--- a/src/dialog/youmu.c
++++ b/src/dialog/youmu.c
+@@ -15,53 +15,13 @@
+ 
+ DIALOG_TASK(youmu, Stage1PreBoss) {
+ 	DIALOG_BEGIN(Stage1PreBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(cirno);
+-	HIDE(cirno);
+-
+-	FACE(youmu, happy);
+-	MSG(youmu, "I suppose falling snow can be just as pretty as cherry blossoms…");
+-
+ 	EVENT(boss_appears);
+-	MSG(cirno, "Hey!");
+-	SHOW(cirno);
+-
+-	MSG(cirno, "I’m cooler than you, so get off my lake!");
+-	FACE(youmu, unamused);
+-	MSG(youmu, "I can see you’re quite cold, yes.");
+-	FACE(youmu, smug);
+-	MSG(youmu, "I tend to dislike dueling those weaker than myself, so I’d appreciate it if you’d step aside.");
+-
+-	TITLE_CIRNO(cirno);
+-	MSG(cirno, "Hah! Maybe YOU should step aside, then!");
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "I suppose it’s as good a time as any to practice my Snowflake-Destruction Technique.");
+-
+ 	EVENT(music_changes);
+-	FACE(cirno, angry);
+-	MSG(cirno, "But if I turn you into a snowflake, you’ll have to chop yourself in half!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(youmu, Stage1PostBoss) {
+ 	DIALOG_BEGIN(Stage1PostBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(cirno);
+-	VARIANT(cirno, defeated);
+-	FACE(cirno, defeated);
+-
+-	FACE(youmu, sigh);
+-	MSG(youmu, "The cold is no good for such fine blades…");
+-
+-	MSG(cirno, "Y-you should be careful with t-those!");
+-
+-	FACE(youmu, unamused);
+-	MSG(youmu, "Yes, that’s what I was just saying.");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -71,68 +31,13 @@ DIALOG_TASK(youmu, Stage1PostBoss) {
+ 
+ DIALOG_TASK(youmu, Stage2PreBoss) {
+ 	DIALOG_BEGIN(Stage2PreBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(hina);
+-	HIDE(hina);
+-
+-	FACE(youmu, normal);
+-	MSG(youmu, "So this is Yōkai Mountain…");
+-	MSG(youmu, "A shame, I’ve heard this is usually quite a lovely place.");
+-
+ 	EVENT(boss_appears);
+-	MSG(hina, "Oh my, what’s this? A new face?");
+-	SHOW(hina);
+-	MSG(hina, "And who might you be, dear?");
+-
+-	MSG(youmu, "Konpaku Yōmu. I am on a mission from Lady Yuyuko to investigate—");
+-
+-	TITLE_HINA(hina);
+-	MSG(hina, "I’ve never heard of this ‘Lady Yuyuko’ you speak of, but I can’t let this slide.");
+-	FACE(youmu, normal);
+-	FACE(hina, serious);
+-	MSG(hina, "Young girls such as yourself shouldn’t be sent to do such dangerous errands!");
+-
+-	FACE(youmu, embarrassed);
+-	MSG(youmu, "‘Y-Young girl’?! I’ll have you know that I am an expert swordswoman—");
+-	MSG(youmu, "—having mastered my technique over *decades*—");
+-	MSG(youmu, "—dare I say even the best in Gensōkyō—");
+-
+-	FACE(hina, normal);
+-	MSG(hina, "Aww… but you’re so adorable! No way someone like you could be into that.");
+-	MSG(hina, "Are you sure this ‘expert swordswoman’ thing isn’t just some sort of teenage phase?");
+-
+-	FACE(youmu, unamused);
+-	MSG(youmu, "It’s not a PHASE, mo—");
+-	FACE(youmu, embarrassed);
+-	MSG(youmu, "…!!");
+-
+ 	EVENT(music_changes);
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(youmu, Stage2PostBoss) {
+ 	DIALOG_BEGIN(Stage2PostBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(hina);
+-	VARIANT(hina, defeated);
+-	FACE(hina, defeated);
+-
+-	MSG(hina, "Did you just call me ‘mom’…?");
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "I did not.");
+-	MSG(youmu, "It must be the madness overcoming you.");
+-	MSG(youmu, "Yes, indeed.");
+-
+-	FACE(hina, normal);
+-	MSG(hina, "My, my…~");
+-
+-	FACE(youmu, unamused);
+-	MSG(youmu, "Don’t you dare.");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -142,89 +47,13 @@ DIALOG_TASK(youmu, Stage2PostBoss) {
+ 
+ DIALOG_TASK(youmu, Stage3PreBoss) {
+ 	DIALOG_BEGIN(Stage3PreBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(wriggle);
+-	HIDE(wriggle);
+-	FACE(youmu, relaxed);
+-	MSG(youmu, "The further I go into this forest, the more restless I feel.");
+-	FACE(youmu, normal);
+-	MSG(youmu, "Something is definitely amiss.");
+-
+ 	EVENT(boss_appears);
+-	MSG(wriggle, "Amiss?");
+-	SHOW(wriggle);
+-	MSG(wriggle, "Perhaps you’re frightened by our growing, overwhelming influence?");
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Bugs do not concern me at the moment.");
+-
+-	FACE(wriggle, outraged);
+-	MSG(wriggle, "Oh, so all insects are ‘bugs’ now, hmm? I see how it is!");
+-	TITLE_WRIGGLE(wriggle);
+-	MSG(wriggle, "Ever heard of beetles? Flies? Show us some respect!");
+-
+-	FACE(youmu, normal);
+-	MSG(youmu, "Apologies, I meant no offense.");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "I am on a mission from Lady Yuyuko to end whatever is causing the disturbance—");
+-
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "Oh, oh, I understand now.");
+-	FACE(wriggle, calm);
+-	MSG(wriggle, "The power wielded by an army of giant insects would surely raise some concerns.");
+-	FACE(wriggle, proud);
+-	MSG(wriggle, "Simply put, we want to restore our rightful place in history!");
+-	MSG(wriggle, "It’s only natural that the lower inhabitants of the mountain would get nervous in the face of our natural dominance.");
+-	FACE(wriggle, calm);
+-	MSG(wriggle, "Your apology is accepted. You shall not fear our wrath—");
+-
+-	FACE(youmu, unamused);
+-	MSG(youmu, "… no, no, bugs alone wouldn’t cause this kind of disturbance…");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "All they’re capable of is ruining my carefully manicured garden.");
+-
+-	MSG(wriggle, "Did you just say you’re…");
+-	FACE(wriggle, outraged);
+-	MSG(wriggle, "… a gardener?!");
+-
+ 	EVENT(music_changes);
+-
+-	FACE(youmu, puzzled);
+-	MSG(wriggle, "Your true face is finally revealed!");
+-	MSG(wriggle, "My light shines brighter than ever now! I shall teach this lowly usurper due respect!");
+-	MSG(wriggle, "So that we may live above beyond your green thumb once and for all!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(youmu, Stage3PostBoss) {
+ 	DIALOG_BEGIN(Stage3PostBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(wriggle);
+-	VARIANT(wriggle, defeated);
+-	FACE(wriggle, defeated);
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Are you aware of the legend of the Tonbokiri?");
+-	MSG(youmu, "It was said its blade could cut insects in half simply by them landing on it.");
+-	FACE(youmu, smug);
+-	MSG(youmu, "Undoubtedly, that is what has transpired today.");
+-
+-	MSG(wriggle, "That’s not the past I saw…");
+-
+-	MSG(youmu, "How unfortunate for you.");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Fear not. I will end your delusional madness and restore justice and order to the—");
+-	FACE(youmu, eeeeh);
+-	MSG(youmu, "… ugh, that’s a little much, even for me, isn’t it?");
+-
+-	MSG(wriggle, "Seems about right, honestly…");
+-
+-	FACE(youmu, unamused);
+-	MSG(youmu, "…");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -234,108 +63,13 @@ DIALOG_TASK(youmu, Stage3PostBoss) {
+ 
+ DIALOG_TASK(youmu, Stage4PreBoss) {
+ 	DIALOG_BEGIN(Stage4PreBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(kurumi);
+-	HIDE(kurumi);
+-
+-	MSG(youmu, "A-ha, I must be close to the true entrance now.");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "This tower… I can already feel it…");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Could this be a challenge worthy of my skills…?!");
+-
+ 	EVENT(boss_appears);
+-	SHOW(kurumi);
+-	MSG(kurumi, "Really? This mansion is actually pretty trashy, though.");
+-	FACE(youmu, relaxed);
+-	MSG(youmu, "Who might you be?");
+-
+-	TITLE_KURUMI(kurumi);
+-	FACE(kurumi, tsun);
+-	MSG(kurumi, "Hmph! I’m Kurumi, a lone black rose drowning in a sea of bad taste!");
+-	MSG(kurumi, "You better remember that!");
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Perhaps I will.");
+-	FACE(youmu, normal);
+-	MSG(youmu, "Are you an associate of this… mansion-tower’s denizens, then?");
+-
+-	FACE(kurumi, dissatisfied);
+-	MSG(kurumi, "Of course not! Who do you take me for?!");
+-	MSG(kurumi, "No WAY I’d want to associate myself with the dweebs running this mansion!");
+-	MSG(kurumi, "They dress like they’ve fallen out of a bad 80s anime!");
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "I see. I have no immediate reason to distrust you.");
+-	FACE(youmu, puzzled);
+-	MSG(youmu, "… what’s an ‘80s anime’, though, if I may ask?");
+-
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "I don’t know, don’t ask me!");
+-	MSG(kurumi, "The lady in the tower talks about it a lot, so it must be something horrible for sure.");
+-
+-	FACE(youmu, unamused);
+-	MSG(youmu, "Didn’t you just say you weren’t associated with them?");
+-
+-	MSG(kurumi, "Yeah, but I was lying to see how gullible you were.");
+-
+-	FACE(youmu, embarrassed);
+-	MSG(youmu, "O-of course. I-I knew that.");
+-	FACE(youmu, normal);
+-	MSG(youmu, "I wanted to see if you’d come clean.");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "My true challenge lies beyond you. Step aside.");
+-
+ 	EVENT(music_changes);
+-
+-	MSG(kurumi, "Nope. You’ve got a dance with a gorgeous vampire scheduled first!");
+-	MSG(kurumi, "En garde, brooding swordsgirl!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(youmu, Stage4PostBoss) {
+ 	DIALOG_BEGIN(Stage4PostBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(kurumi);
+-	VARIANT(kurumi, defeated);
+-	FACE(kurumi, defeated);
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Despite your inferior technique, I must thank you.");
+-	MSG(youmu, "‘Dancing’ with you has been a pleasant distraction on the path to completing my mission.");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Tell your ‘leader’ that I am coming for them.");
+-
+-	MSG(kurumi, "(She earnestly talks like a manga anti-hero…)");
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "O-Oh, okay then!");
+-	FACE(kurumi, defeated);
+-	MSG(kurumi, "I’m sick of guarding this creepy, spooky mansion anyways.");
+-
+-	FACE(youmu, unamused);
+-	MSG(youmu, "S-… spooky?");
+-
+-	FACE(kurumi, puzzled);
+-	MSG(kurumi, "…?");
+-	FACE(kurumi, normal);
+-	MSG(kurumi, "… yeah! I thought it was gonna be all ‘scientific’ or whatever, but then they made it haunted, with like, ghosts and stuff!");
+-
+-	FACE(youmu, eeeeh);
+-	MSG(youmu, "G-…");
+-	MSG(youmu, "GHOSTS?!");
+-
+-	MSG(kurumi, "Scary vengeful ghosts! Trying to kill you, even!");
+-	MSG(kurumi, "But surely a strong swordsgirl like yourself could handle it.");
+-
+-	FACE(youmu, embarrassed);
+-	MSG(youmu, "B-Bring it on! Nothing will stand in my way!");
+-
+-	FACE(kurumi, tsun);
+-	MSG(kurumi, "(Teehee, so gullible.)");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -345,132 +79,19 @@ DIALOG_TASK(youmu, Stage4PostBoss) {
+ 
+ DIALOG_TASK(youmu, Stage5PreBoss) {
+ 	DIALOG_BEGIN(Stage5PreBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(iku);
+-	HIDE(iku);
+-
+-	FACE(youmu, relaxed);
+-	MSG(youmu, "Incredible. Truly astounding.");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Yes, the final battle approaches. I can feel it.");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Will it be a legendary duel? One to go down in the history of Gensōkyō?!");
+-
+ 	EVENT(boss_appears);
+-	MSG(iku, "Oh, the gardener from the Netherworld?");
+-	SHOW(iku);
+-	MSG(iku, "It’s no surprise to see you here.");
+-	MSG(iku, "Your mistress has been taken by the Tower’s presence, I assume?");
+-
+-	FACE(youmu, normal);
+-	MSG(youmu, "Lady Yuyuko is in a safe, undisclosed location.");
+-
+-	MSG(iku, "The Hakurei Shrine, I presume?");
+-
+-	FACE(youmu, surprised);
+-	MSG(youmu, "Wh-who told you?! Are you in league with them too?!");
+-
+-	FACE(iku, smile);
+-	MSG(iku, "Of course not, but where else would she be at a time like this?");
+-
+-	FACE(youmu, unamused);
+-	MSG(youmu, "Hmph. Perhaps we have become too predictable.");
+-	MSG(youmu, "I am here to settle this matter. You need not concern yourself—");
+-
+-	FACE(iku, normal);
+-	MSG(iku, "On the contrary, I would say.");
+-	TITLE_IKU(iku);
+-	FACE(youmu, normal);
+-	MSG(iku, "I decided to do some research on my own.");
+-	MSG(iku, "This tower is controlled by a machine…");
+-	FACE(iku, serious);
+-	MSG(iku, "… and the machine’s effects seem to go well beyond Gensōkyō’s boundaries.");
+-
+-	FACE(youmu, normal);
+-	MSG(youmu, "Including the heavens, I presume? I see.");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Fear not. I will allow nothing to stand in my way.");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Konpaku Yōmu, the greatest swordswoman to live and die, will settle this incident once and—");
+-
+-	FACE(iku, smile);
+-	MSG(iku, "It seems that the machine has also overinflated your ego, Swordswoman of Hakugyokurō.");
+-	FACE(iku, serious);
+-	MSG(iku, "Would caution not be prudent in this situation?");
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Overinflated ego? Nonsense.");
+-	MSG(youmu, "During my recent battles, I have achieved a flow state most blademasters only dream of!");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Through that, I have realized the true form of my previously-incomplete yōkai-vanquishing technique!");
+-
+-	FACE(iku, smile);
+-	MSG(iku, "Is that so?");
+-
+-	FACE(youmu, sigh);
+-	MSG(youmu, "More doubt from ignorant skeptics, I see.");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Shall we duel so that I may demonstrate to your satisfaction?!");
+-
+-	FACE(iku, serious);
+-	MSG(iku, "W-wait, that is not what I meant, I simply—");
+-
+-	MSG(youmu, "I can see it in your expression! The doubt! The fear!");
+-	MSG(youmu, "But I have become one with my swords, achieving a perfection that no other before me has been able—");
+-
+ 	EVENT(music_changes);
+-
+-	MSG(iku, "Ah, I haven’t the time for this nonsense!");
+-	MSG(iku, "I will not allow you to march onwards to your demise!");
+-
+-	MSG(youmu, "Finally! Then, witness the overwhelming strength of my Rōkanken!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(youmu, Stage5PostMidBoss) {
+ 	DIALOG_BEGIN(Stage5PostMidBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	FACE(youmu, smug);
+-
+ 	// should be only one message with a fixed 180-frames timeout
+-	MSG_UNSKIPPABLE(youmu, 180, "Lightning? Hmph. I can outrun it with ease.");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(youmu, Stage5PostBoss) {
+ 	DIALOG_BEGIN(Stage5PostBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(iku);
+-	VARIANT(iku, defeated);
+-	FACE(iku, defeated);
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "All according to plan.");
+-
+-	MSG(iku, "Your logic is so twisted…");
+-	MSG(iku, "Alas, it cannot be helped. You have likely been affected since before your arrival.");
+-	MSG(iku, "I have no choice but to let you through, despite my reservations.");
+-	MSG(iku, "Perhaps pure intentions lurk behind that ego of yours.");
+-
+-	MSG(youmu, "And perhaps I truly have gone mad. What of it?");
+-	MSG(youmu, "My mission is crystal clear:");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "… to carry out Lady Yuyuko’s mission, and to bring peace to Gensōkyō and all connected realms!");
+-	MSG(youmu, "I will not fail!");
+-
+-	MSG(iku, "I-I see.");
+-	MSG(iku, "Ascend the staircase. You will find the perpetrator waiting for you there.");
+-	MSG(iku, "Be prepared. The technology she possesses is from a so-called ‘parallel universe’.");
+-	MSG(iku, "It is unlike anything any of us have encountered before. Even I am not sure of its specifics.");
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Fear not, I will slice her infernal machine in half like an invasive weed.");
+-
+ 	DIALOG_END();
+ }
+ 
+@@ -480,123 +101,13 @@ DIALOG_TASK(youmu, Stage5PostBoss) {
+ 
+ DIALOG_TASK(youmu, Stage6PreBoss) {
+ 	DIALOG_BEGIN(Stage6PreBoss);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(elly);
+-	HIDE(elly);
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Ah.");
+-	FACE(youmu, happy);
+-	MSG(youmu, "Ahaha.");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Ah-hahaha!");
+-	MSG(youmu, "Yes. Yes! This is it!");
+-	MSG(youmu, "What a magnificent arena for a heroic final battle!!");
+-
+ 	EVENT(boss_appears);
+-	MSG(elly, "Nothing seems to slow you down, hmm?");
+-
+-	SHOW(elly);
+-	MSG(elly, "Such an annoyance. But that’s to be expected of the folk of this Gensōkyō.");
+-
+-	MSG(youmu, "And I see that you’re a master of the blade, a shinigami no less!");
+-	FACE(youmu, happy);
+-	MSG(youmu, "Absolutely splendid!");
+-
+-	TITLE_ELLY(elly);
+-	MSG(elly, "Ah, I’m no shinigami, especially not now.");
+-
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "The scythe is a rather particular weapon, you must understand. Forgive me presumptiveness.");
+-
+-	MSG(elly, "I see. I used to rely on this scythe as a gatekeeper, in the real Gensōkyō.");
+-	FACE(elly, angry);
+-	MSG(elly, "Now, it will be the sigil of a new era!");
+-	FACE(elly, shouting);
+-	MSG(elly, "One that we, the ‘forgotten’, will reign over!");
+-
+-	MSG(youmu, "Such an unwieldy weapon… for anyone to choose it willingly…");
+-	MSG(youmu, "Either you’re incredibly skilled, or incredibly foolish.");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "I wish to find that out!");
+-	MSG(youmu, "After our duel, let us meet and discuss our techniques!");
+-
+-	FACE(elly, angry);
+-	MSG(elly, "Techniques? Hah!");
+-	MSG(elly, "I’m sure our existence means nothing to you! And the feeling is mutual!");
+-
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "On the contrary, scythe-bearer!");
+-	MSG(youmu, "You’ve created an impeccable stage for our final confrontation.");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "But first, please, tell me: what is your mission? What is it you desire?");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "For us to share this… intimate moment, I desire to know everything about you.");
+-
+-	FACE(elly, blush);
+-	MSG(elly, "…!");
+-	MSG(elly, "O-Our mission, is t-to—");
+-
+-	FACE(elly, eyes_closed);
+-	MSG(elly, "…");
+-	FACE(elly, angry);
+-	MSG(elly, "… is to avenge our forgotten f-friends!");
+-	MSG(elly, "We will create a new era of Gensōkyō, where the truly forgotten can live another day!");
+-	MSG(elly, "Soon, the residents of this land will be driven mad beyond comprehension, and be ripe to conquer!");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "So you wish to avenge your fallen compatriots… how noble…");
+-	MSG(youmu, "I can feel it move me to tears…");
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Alas, my mission, given to me by Lady Yuyuko of the Netherworld, directly conflicts with yours!");
+-	MSG(youmu, "I cannot allow you to drive my compatriots mad, or to subjugate my home!");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "Perhaps, in another time and place, we could have been friends!");
+-
+-	FACE(elly, angry);
+-	MSG(elly, "B-Being friends with you h-heartless folk would be a sin! I could never!");
+-
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "What a tragedy!");
+-
+-	FACE(elly, shouting);
+-	MSG(elly, "You’re aiming to be the big ‘hero’ of this Gensōkyō, aren’t you?!");
+-
+-	MSG(youmu, "Naturally! No different than how you wish to be the hero of ‘your’ Gensōkyō!");
+-	FACE(youmu, eyes_closed);
+-	MSG(youmu, "We’re not so different, you and I.");
+-
+-	FACE(elly, smug);
+-	MSG(elly, "Your courage is admirable, I’ll give you that.");
+-	FACE(elly, angry);
+-	MSG(elly, "But there’s an enormous difference between us, swordswoman.");
+-
+ 	EVENT(music_changes);
+-
+-	FACE(elly, shouting);
+-	FACE(youmu, normal);
+-	MSG(elly, "For I possess the knowledge of science and rationality!");
+-	MSG(elly, "In a magic-filled world like this, they cut through delusional opponents with unparalleled precision!");
+-	MSG(elly, "Let’s see what good your swords do you when you fall prey to true enlightenment!");
+-
+ 	DIALOG_END();
+ }
+ 
+ DIALOG_TASK(youmu, Stage6PreFinal) {
+ 	DIALOG_BEGIN(Stage6PreFinal);
+-
+-	ACTOR_LEFT(youmu);
+-	ACTOR_RIGHT(elly);
+-	VARIANT(elly, beaten);
+-	FACE(elly, angry);
+-
+-	FACE(youmu, chuuni);
+-	MSG(youmu, "Impressive! You’ve pushed me to 10% of my true power!");
+-
+-	MSG(elly, "Your despicable pride will be your downfall!");
+-	FACE(elly, shouting);
+-	MSG(elly, "Behold, your judgement before the true nature of reality!");
+-
+ 	DIALOG_END();
+ }
+ 
+diff --git a/src/eventloop/eventloop.c b/src/eventloop/eventloop.c
+index 1d594d47..03547caf 100644
+--- a/src/eventloop/eventloop.c
++++ b/src/eventloop/eventloop.c
+@@ -36,7 +36,9 @@ void eventloop_enter(void *context, LogicFrameFunc frame_logic, RenderFrameFunc
+ 	frame->frametime = HRTIME_RESOLUTION / target_fps;
+ 	frame->prev_logic_action = LFRAME_WAIT;
+ 
+-	vfs_sync(VFS_SYNC_STORE, NO_CALLCHAIN);
++	if(!global.is_simulation) {
++		vfs_sync(VFS_SYNC_STORE, NO_CALLCHAIN);
++	}
+ }
+ 
+ void eventloop_leave(void) {
+@@ -56,6 +58,41 @@ void eventloop_leave(void) {
+ 	}
+ }
+ 
++bool eventloop_is_active(void) {
++	return evloop.stack_ptr != NULL;
++}
++
++LogicFrameAction eventloop_step_logic(void) {
++	assert(thread_current_is_main());
++
++	LoopFrame *frame = evloop.stack_ptr;
++	if(frame == NULL) {
++		return LFRAME_STOP;
++	}
++
++	evloop.frame_times.target = frame->frametime;
++	evloop.frame_times.start = time_get();
++	evloop.frame_times.next = evloop.frame_times.start + evloop.frame_times.target;
++
++	LogicFrameAction action = run_logic_frame(frame);
++
++	// When simulating, we shouldn't get into menus.
++	// Defensive programming.
++	while(evloop.stack_ptr != frame && evloop.stack_ptr != NULL) {
++		frame = evloop.stack_ptr;
++		action = run_logic_frame(frame);
++	}
++
++	if(action == LFRAME_STOP) {
++		eventloop_leave();
++		if(evloop.stack_ptr == NULL) {
++			return LFRAME_STOP;
++		}
++	}
++
++	return action;
++}
++
+ FrameTimes eventloop_get_frame_times(void) {
+ 	return evloop.frame_times;
+ }
+diff --git a/src/eventloop/eventloop.h b/src/eventloop/eventloop.h
+index d54fed2c..32185542 100644
+--- a/src/eventloop/eventloop.h
++++ b/src/eventloop/eventloop.h
+@@ -43,4 +43,9 @@ void eventloop_enter(
+ 
+ void eventloop_run(void);
+ 
++// Runs exactly one  frame
++// Returns LFRAME_STOP if the loop is inactive
++LogicFrameAction eventloop_step_logic(void);
++bool eventloop_is_active(void);
++
+ FrameTimes eventloop_get_frame_times(void);
+diff --git a/src/global.c b/src/global.c
+index e9daae7b..6beede1f 100644
+--- a/src/global.c
++++ b/src/global.c
+@@ -93,6 +93,10 @@ static void *sync_task(void *arg) {
+ }
+ 
+ void taisei_commit_persistent_data(void) {
++	if(global.is_simulation) {
++		return;
++	}
++
+ 	if(!SDL_CompareAndSwapAtomicInt(&syncing_data, 0, 1)) {
+ 		log_warn("Commit already in progress");
+ 		return;
+diff --git a/src/global.h b/src/global.h
+index a6d9e903..15c9dc54 100644
+--- a/src/global.h
++++ b/src/global.h
+@@ -100,6 +100,7 @@ typedef struct {
+ 	uint is_headless : 1;
+ 	uint is_replay_verification : 1;
+ 	uint is_kiosk_mode : 1;
++	uint is_simulation : 1;
+ } Global;
+ 
+ extern Global global;
+diff --git a/src/meson.build b/src/meson.build
+index a032c85e..fd3f30c5 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -207,6 +207,7 @@ configure_file(configuration : config, output : 'build_config.h')
+ 
+ taisei_basename = (macos_app_bundle ? 'Taisei' : 'taisei')
+ have_libtaisei = false
++have_taisei_exe = false
+ have_debug_syms_target = false
+ 
+ if host_machine.system() == 'emscripten'
+@@ -475,8 +476,12 @@ else
+         link_with : libtaisei,
+     )
+ 
++    subdir('sim')
++
++    have_taisei_exe = true
+     taisei = executable(taisei_basename, taisei_main_src,
+         dependencies : stages_live_reload ? libtaisei_dep.as_link_whole() : libtaisei_dep,
++        c_args : taisei_sim_c_args,
+         win_subsystem : get_option('win_console') ? 'console' : 'windows',
+         install : true,
+         install_dir : bindir,
+diff --git a/src/sim/meson.build b/src/sim/meson.build
+new file mode 100644
+index 00000000..cc33a783
+--- /dev/null
++++ b/src/sim/meson.build
+@@ -0,0 +1,34 @@
++# Headless simulation C API (taisei_sim_*).
++#
++# src/meson.build (added by the taisei-sim fork) calls subdir('sim') but the
++# fork never committed this file, so the meson build fails without it. This
++# reconstruction compiles the sim into the main taisei executable and exports
++# the C API:
++#
++#   - sim.c / runtime.c are appended to taisei_main_src (the executable's
++#     extra sources; the executable is declared right after this subdir()).
++#   - TAISEI_SIM_BUILD enables the export decorators in taisei_sim.h
++#     (__declspec(dllexport) on Windows, default visibility elsewhere).
++#
++# The whole project only ever includes sim/taisei_sim.h from these two files,
++# so scoping the define to the executable's own sources has no other effect.
++# (add_project_arguments can't be used here: the subdir() targets have already
++# been declared, and meson forbids project args after a target declaration.)
++
++taisei_sim_c_args = ['-DTAISEI_SIM_BUILD']
++
++taisei_main_src += files('sim.c', 'runtime.c')
++
++# The Python harness loads this shared module, NOT the executable:
++# a real DLL runs its DllMain (mingw CRT init) when LoadLibrary() is called.
++# An EXE loaded via LoadLibrary never runs its CRT entry point, so every CRT
++# call inside it (snprintf/fopen/malloc) crashes. (Verified empirically:
++# a pure-snprintf probe exported by the exe access-violated.)
++# Everything (SDL3 included) is linked statically, so the DLL is self-contained
++# apart from the mingw runtime DLLs (libgcc_s_seh-1, libwinpthread, libstdc++).
++taisei_sim = shared_module('taisei_sim',
++    files('sim.c', 'runtime.c'),
++    c_args : taisei_sim_c_args,
++    dependencies : libtaisei_dep,
++    install : false,
++)
+diff --git a/src/sim/runtime.c b/src/sim/runtime.c
+new file mode 100644
+index 00000000..38ca9fca
+--- /dev/null
++++ b/src/sim/runtime.c
+@@ -0,0 +1,166 @@
++/*
++ * Internal runtime for thrl of taisei-sim.
++ */
++#include "runtime.h"
++
++#include "audio/audio.h"
++#include "resource/bgm.h"
++#include "cli.h"
++#include "config.h"
++#include "coroutine/coroutine.h"
++#include "dynstage.h"
++#include "events.h"
++#include "filewatch/filewatch.h"
++#include "gamepad.h"
++#include "global.h"
++#include "hirestime.h"
++#include "i18n/i18n.h"
++#include "log.h"
++#include "log_sdl.h"
++#include "memory/memory.h"
++#include "progress.h"
++#include "renderer/api.h"
++#include "renderer/common/models.h"
++#include "renderer/common/sprite_batch.h"
++#include "resource/resource.h"
++#include "stageinfo.h"
++#include "stageobjects.h"
++#include "taskmanager.h"
++#include "thread.h"
++#include "util/env.h"
++#include "util/gamemode.h"
++#include "vfs/setup.h"
++#include "video.h"
++#include "watchdog.h"
++
++#include <locale.h>
++#include <stdio.h>
++#include <string.h>
++
++static bool runtime_initialized;
++static bool vfs_ready;
++
++static void sim_vfs_ready(CallChainResult ccr) {
++    (void)ccr;
++    vfs_ready = true;
++}
++
++static void set_path_env(const char *name, const char *value) {
++    if(value && *value) {
++        env_set(name, value, true);
++    }
++}
++
++TaiseiSimResult taisei_sim_runtime_init(const TaiseiSimGlobalConfig *config, char *error, size_t error_size) {
++    if(runtime_initialized) {
++        snprintf(error, error_size, "Simulation is already inited");
++        return TAISEI_SIM_ERROR_ALREADY_INITIALIZED;
++    }
++    if(config->flags != 0 || config->reserved != 0) {
++        snprintf(error, error_size, "Unknown simulation flags");
++        return TAISEI_SIM_ERROR_INVALID_ARGUMENT;
++    }
++
++    setlocale(LC_ALL, "C");
++
++    /*
++     * This must be the first call into SDL. env_set() below go through
++     * SDL_GetEnvironment(), which allocate SDL's process env.
++     * Else, signsegv.
++     */
++    mem_install_sdl_callbacks();
++
++    set_path_env("TAISEI_RES_PATH", config->resource_path);
++    set_path_env("TAISEI_STORAGE_PATH", config->storage_path);
++    set_path_env("TAISEI_CACHE_PATH", config->cache_path);
++    env_set("SDL_AUDIODRIVER", "dummy", true);
++    env_set("SDL_VIDEODRIVER", "dummy", true);
++    env_set("TAISEI_AUDIO_BACKEND", "null", true);
++    env_set("TAISEI_RENDERER", "null", true);
++    env_set("TAISEI_FRAMELIMITER_LOGIC_ONLY", "1", true);
++
++    thread_init();
++    coroutines_init();
++    log_init(LOG_DEFAULT_LEVELS);
++    stageinfo_init();
++
++    vfs_ready = false;
++    vfs_setup(CALLCHAIN(sim_vfs_ready, NULL));
++    if(!vfs_ready) {
++        snprintf(error, error_size, "VFS setup aren't supported");
++        return TAISEI_SIM_ERROR_INTERNAL;
++    }
++
++    config_load();
++
++    if(!SDL_Init(SDL_INIT_EVENTS)) {
++        snprintf(error, error_size, "SDL_Init failed: %s", SDL_GetError());
++        return TAISEI_SIM_ERROR_INTERNAL;
++    }
++
++    log_sdl_init(SDL_LOG_PRIORITY_WARN);
++    taskmgr_global_init();
++    gamemode_init();
++    time_init();
++
++    CLIAction cli = { .frameskip = 1 };
++    init_global(&cli);
++    global.is_headless = true;
++    global.is_simulation = true;
++    global.frameskip = 1;
++
++    events_init();
++    video_init(&(VideoInitParams) {
++        .width = RESX,
++        .height = RESY,
++    });
++    filewatch_init();
++    res_init();
++    r_models_init();
++    r_sprite_batch_init();
++    r_post_init();
++    i18n_init();
++    dynstage_init_monitoring();
++    audio_init();
++    res_post_init();
++    gamepad_init();
++    progress_load();
++    video_post_init();
++
++    runtime_initialized = true;
++    return TAISEI_SIM_OK;
++}
++
++void taisei_sim_runtime_shutdown(void) {
++    if(!runtime_initialized) {
++        return;
++    }
++
++    dynstage_shutdown();
++    i18n_shutdown();
++    r_release_resources();
++    res_shutdown();
++    watchdog_shutdown();
++    progress_unload();
++    stage_objpools_shutdown();
++    gamemode_shutdown();
++    taskmgr_global_shutdown();
++    audio_shutdown();
++    r_models_shutdown();
++    r_sprite_batch_shutdown();
++    video_shutdown();
++    gamepad_shutdown();
++    stageinfo_shutdown();
++    config_shutdown();
++    filewatch_shutdown();
++    vfs_shutdown();
++    events_shutdown();
++    time_shutdown();
++    coroutines_shutdown();
++    log_queue_shutdown();
++    thread_shutdown();
++    log_shutdown();
++    SDL_Quit();
++
++    runtime_initialized = false;
++}
+diff --git a/src/sim/runtime.h b/src/sim/runtime.h
+new file mode 100644
+index 00000000..e200f027
+--- /dev/null
++++ b/src/sim/runtime.h
+@@ -0,0 +1,6 @@
++#pragma once
++
++#include "sim/taisei_sim.h"
++
++TaiseiSimResult taisei_sim_runtime_init(const TaiseiSimGlobalConfig *config, char *error, size_t error_size);
++void taisei_sim_runtime_shutdown(void);
+diff --git a/src/sim/sim.c b/src/sim/sim.c
+new file mode 100644
+index 00000000..46af9637
+--- /dev/null
++++ b/src/sim/sim.c
+@@ -0,0 +1,1289 @@
++/* 
++ * So, it is again a project like ReC98. But it is pretty simple then: 
++ * I don't need to look at ancient C++ code anymore and it is like just
++ * the `github.com/touhourl/thrl/tree/main/src/games/th05_c/reader.rs`
++ * but in C. 
++ */
++#include "sim/taisei_sim.h"
++#include "sim/runtime.h"
++
++#include "boss.h"
++#include "difficulty.h"
++#include "eventloop/eventloop.h"
++#include "global.h"
++#include "item.h"
++#include "lasers/laser.h"
++#include "memory/memory.h"
++#include "player.h"
++#include "plrmodes.h"
++#include "projectile.h"
++#include "replay/replay.h"
++#include "replay/state.h"
++#include "replay/struct.h"
++#include "resource/resource.h"
++#include "stage.h"
++#include "stageinfo.h"
++#include "stats.h"
++
++#include <math.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define SIM_ERROR_SIZE 512
++#define SIM_ABORT_FRAME_LIMIT (FPS * 10)
++
++struct TaiseiSim {
++    ResourceGroup resources;
++    Replay replay;
++    TaiseiSimEpisodeStatus status;
++    bool episode_active;
++    bool replay_complete;
++    bool replay_initialized;
++    uint32_t desired_buttons;
++    uint32_t applied_buttons;
++    uint64_t initial_seed;
++    uint64_t start_time;
++    double laser_sample_step;
++    TaiseiSimVec2 previous_player_position;
++    float recent_boss_damage;
++    char error[SIM_ERROR_SIZE];
++
++    TaiseiSimState snapshot;
++    TaiseiSimProjectileState *projectiles;
++    size_t projectile_capacity;
++    TaiseiSimEnemyState *enemies;
++    size_t enemy_capacity;
++    TaiseiSimItemState *items;
++    size_t item_capacity;
++    TaiseiSimLaserState *lasers;
++    size_t laser_capacity;
++    TaiseiSimLaserPoint *laser_points;
++    size_t laser_point_capacity;
++};
++
++static bool library_initialized;
++static TaiseiSim *active_sim;
++static char global_error[SIM_ERROR_SIZE];
++
++static TaiseiSimResult set_error(TaiseiSim *sim, TaiseiSimResult result, const char *message) {
++    char *dst = sim ? sim->error : global_error;
++    snprintf(dst, SIM_ERROR_SIZE, "%s", message ? message : "Unknown simulation error");
++    return result;
++}
++
++static TaiseiSimResult validate_sim(TaiseiSim *sim) {
++    if(sim == NULL || sim != active_sim) {
++        return set_error(NULL, TAISEI_SIM_ERROR_INVALID_HANDLE, "Invalid or inactive simulation handle");
++    }
++    return TAISEI_SIM_OK;
++}
++
++static bool struct_is_compatible(uint32_t provided, size_t required) {
++    return provided >= required;
++}
++
++static TaiseiSimVec2 vec2_from_complex(cmplx value) {
++    return (TaiseiSimVec2) { .x = re(value), .y = im(value) };
++}
++
++static void *grow_array(void *ptr, size_t *capacity, size_t required, size_t elem_size) {
++    if(required <= *capacity) {
++        return ptr;
++    }
++
++    size_t cap = *capacity ? *capacity : 64;
++    while(cap < required) {
++        cap *= 2;
++    }
++
++    ptr = mem_realloc(ptr, cap * elem_size);
++    *capacity = cap;
++    return ptr;
++}
++
++static int compare_projectiles(const void *a, const void *b) {
++    const TaiseiSimProjectileState *pa = a;
++    const TaiseiSimProjectileState *pb = b;
++    return (pa->spawn_id > pb->spawn_id) - (pa->spawn_id < pb->spawn_id);
++}
++
++static int compare_enemies(const void *a, const void *b) {
++    const TaiseiSimEnemyState *ea = a;
++    const TaiseiSimEnemyState *eb = b;
++    return (ea->spawn_id > eb->spawn_id) - (ea->spawn_id < eb->spawn_id);
++}
++
++static int compare_items(const void *a, const void *b) {
++    const TaiseiSimItemState *ia = a;
++    const TaiseiSimItemState *ib = b;
++    return (ia->spawn_id > ib->spawn_id) - (ia->spawn_id < ib->spawn_id);
++}
++
++static int compare_laser_ptrs(const void *a, const void *b) {
++    const Laser *la = *(Laser *const *)a;
++    const Laser *lb = *(Laser *const *)b;
++    return (la->ent.spawn_id > lb->ent.spawn_id) - (la->ent.spawn_id < lb->ent.spawn_id);
++}
++
++static uint64_t digest_bytes(uint64_t digest, const void *data, size_t size) {
++    const uint8_t *bytes = data;
++    for(size_t i = 0; i < size; ++i) {
++        digest ^= bytes[i];
++        digest *= UINT64_C(1099511628211);
++    }
++    return digest;
++}
++
++static uint32_t boss_phase_type(const Attack *attack) {
++    if(!attack) {
++        return TAISEI_SIM_BOSS_PHASE_NONE;
++    }
++
++    switch(attack->type) {
++        case AT_Normal: return TAISEI_SIM_BOSS_PHASE_NONSPELL;
++        case AT_Move: return TAISEI_SIM_BOSS_PHASE_MOVE;
++        case AT_Spellcard: return TAISEI_SIM_BOSS_PHASE_SPELL;
++        case AT_SurvivalSpell: return TAISEI_SIM_BOSS_PHASE_SURVIVAL;
++        case AT_ExtraSpell: return TAISEI_SIM_BOSS_PHASE_EXTRA;
++    }
++
++    return TAISEI_SIM_BOSS_PHASE_NONE;
++}
++
++static uint16_t stable_spell_id(const Attack *attack) {
++    if(!attack || !attack->info || !ATTACK_IS_SPELL(attack->type)) {
++        return 0;
++    }
++
++    StageInfo *spell_stage = stageinfo_get_by_spellcard(attack->info, global.diff);
++    return spell_stage ? spell_stage->id : 0;
++}
++
++static uint16_t stage_type(StageType type) {
++    switch(type) {
++        case STAGE_STORY: return TAISEI_SIM_STAGE_STORY;
++        case STAGE_EXTRA: return TAISEI_SIM_STAGE_EXTRA;
++        case STAGE_SPELL: return TAISEI_SIM_STAGE_SPELL;
++        case STAGE_SPECIAL: return TAISEI_SIM_STAGE_SPECIAL;
++    }
++    return TAISEI_SIM_STAGE_UNKNOWN;
++}
++
++static void fill_boss_state(TaiseiSim *sim, TaiseiSimBossState *out) {
++    *out = (TaiseiSimBossState) {};
++
++    Boss *boss = global.boss;
++    if(!boss) {
++        out->phase_index = -1;
++        return;
++    }
++
++    out->active = true;
++    out->position = vec2_from_complex(boss->pos);
++    out->velocity = vec2_from_complex(boss->move.velocity);
++    out->invulnerable = !boss_is_vulnerable(boss);
++    out->recent_damage = sim->recent_boss_damage;
++
++    Attack *attack = boss->current;
++    if(!attack) {
++        out->phase_index = -1;
++        return;
++    }
++
++    ptrdiff_t phase_index = attack - boss->attacks;
++    out->phase_index = (phase_index >= 0 && phase_index < BOSS_MAX_ATTACKS) ? (int32_t)phase_index : -1;
++    out->phase_type = boss_phase_type(attack);
++    out->attack_id = out->phase_index >= 0 ? (uint16_t)(out->phase_index + 1) : 0;
++    out->spell_id = stable_spell_id(attack);
++    out->spell_active = ATTACK_IS_SPELL(attack->type) && attack_is_active(attack);
++    out->hp = attack->hp;
++    out->max_hp = attack->maxhp;
++    out->phase_start_frame = attack->starttime;
++    out->phase_end_frame = attack->endtime;
++    out->phase_timeout_frames = attack->timeout;
++    out->remaining_timeout_frames = max(0, attack->starttime + attack->timeout - global.frames);
++    out->spell_failed_frame = attack->failtime;
++    out->spell_failed = attack_was_failed(attack);
++    out->spell_captured = ATTACK_IS_SPELL(attack->type) && attack_has_finished(attack) && !attack_was_failed(attack);
++}
++
++static uint32_t projectile_category(const Projectile *p) {
++    switch(p->type) {
++        case PROJ_ENEMY: return TAISEI_SIM_PROJECTILE_ENEMY;
++        case PROJ_DEAD: return TAISEI_SIM_PROJECTILE_CLEARING;
++        case PROJ_PLAYER: return TAISEI_SIM_PROJECTILE_PLAYER;
++        default: return TAISEI_SIM_PROJECTILE_INVALID;
++    }
++}
++
++static uint32_t projectile_flags(const Projectile *p) {
++    uint32_t flags = 0;
++    if(!(p->flags & PFLAG_NOGRAZE)) flags |= TAISEI_SIM_PROJECTILE_FLAG_GRAZEABLE;
++    if(!(p->flags & PFLAG_NOCLEAR)) flags |= TAISEI_SIM_PROJECTILE_FLAG_CLEARABLE;
++    if(!(p->flags & PFLAG_NOCOLLISION)) flags |= TAISEI_SIM_PROJECTILE_FLAG_COLLISION_ENABLED;
++    if(p->flags & PFLAG_INDESTRUCTIBLE) flags |= TAISEI_SIM_PROJECTILE_FLAG_INDESTRUCTIBLE;
++    if(p->type == PROJ_ENEMY && !(p->flags & PFLAG_NOCOLLISION)) flags |= TAISEI_SIM_PROJECTILE_FLAG_ACTIVE_HAZARD;
++    return flags;
++}
++
++static uint32_t input_flags(PlrInputFlag flags) {
++    uint32_t out = 0;
++    if(flags & INFLAG_UP) out |= TAISEI_SIM_INPUT_UP;
++    if(flags & INFLAG_DOWN) out |= TAISEI_SIM_INPUT_DOWN;
++    if(flags & INFLAG_LEFT) out |= TAISEI_SIM_INPUT_LEFT;
++    if(flags & INFLAG_RIGHT) out |= TAISEI_SIM_INPUT_RIGHT;
++    if(flags & INFLAG_FOCUS) out |= TAISEI_SIM_INPUT_FOCUS;
++    if(flags & INFLAG_SHOT) out |= TAISEI_SIM_INPUT_SHOT;
++    if(flags & INFLAG_SKIP) out |= TAISEI_SIM_INPUT_SKIP;
++    return out;
++}
++
++static uint32_t clear_flags(uint internal_flags) {
++    uint32_t out = 0;
++    if(internal_flags & CLEAR_HAZARDS_BULLETS) out |= TAISEI_SIM_CLEAR_FLAG_BULLETS;
++    if(internal_flags & CLEAR_HAZARDS_LASERS) out |= TAISEI_SIM_CLEAR_FLAG_LASERS;
++    if(internal_flags & CLEAR_HAZARDS_FORCE) out |= TAISEI_SIM_CLEAR_FLAG_FORCED;
++    if(internal_flags & CLEAR_HAZARDS_NOW) out |= TAISEI_SIM_CLEAR_FLAG_IMMEDIATE;
++    if(internal_flags & CLEAR_HAZARDS_SPAWN_VOLTAGE) out |= TAISEI_SIM_CLEAR_FLAG_SPAWNS_VOLTAGE;
++    return out;
++}
++
++static uint32_t item_type(ItemType type) {
++    switch(type) {
++        case ITEM_PIV: return TAISEI_SIM_ITEM_PIV;
++        case ITEM_POINTS: return TAISEI_SIM_ITEM_POINTS;
++        case ITEM_POWER_MINI: return TAISEI_SIM_ITEM_POWER_MINI;
++        case ITEM_POWER: return TAISEI_SIM_ITEM_POWER;
++        case ITEM_SURGE: return TAISEI_SIM_ITEM_SURGE;
++        case ITEM_VOLTAGE: return TAISEI_SIM_ITEM_VOLTAGE;
++        case ITEM_BOMB_FRAGMENT: return TAISEI_SIM_ITEM_BOMB_FRAGMENT;
++        case ITEM_LIFE_FRAGMENT: return TAISEI_SIM_ITEM_LIFE_FRAGMENT;
++        case ITEM_BOMB: return TAISEI_SIM_ITEM_BOMB;
++        case ITEM_LIFE: return TAISEI_SIM_ITEM_LIFE;
++    }
++    return 0;
++}
++
++static uint32_t damage_type(DamageType type) {
++    switch(type) {
++        case DMG_ENEMY_SHOT: return TAISEI_SIM_DAMAGE_ENEMY_SHOT;
++        case DMG_ENEMY_COLLISION: return TAISEI_SIM_DAMAGE_ENEMY_COLLISION;
++        case DMG_PLAYER_SHOT: return TAISEI_SIM_DAMAGE_PLAYER_SHOT;
++        case DMG_PLAYER_BOMB: return TAISEI_SIM_DAMAGE_PLAYER_BOMB;
++        case DMG_PLAYER_DISCHARGE: return TAISEI_SIM_DAMAGE_PLAYER_DISCHARGE;
++        default: return TAISEI_SIM_DAMAGE_UNDEFINED;
++    }
++}
++
++static uint32_t enemy_flags(Enemy *e) {
++    uint32_t flags = 0;
++    if(e->flags & EFLAG_KILLED) flags |= TAISEI_SIM_ENEMY_FLAG_KILLED;
++    if(enemy_is_targetable(e)) flags |= TAISEI_SIM_ENEMY_FLAG_TARGETABLE;
++    if(enemy_is_vulnerable(e)) flags |= TAISEI_SIM_ENEMY_FLAG_DAMAGEABLE;
++    if(!(e->flags & EFLAG_NO_HURT)) flags |= TAISEI_SIM_ENEMY_FLAG_HARMFUL;
++    if(e->flags & EFLAG_INVULNERABLE) flags |= TAISEI_SIM_ENEMY_FLAG_INVULNERABLE;
++    if(e->flags & EFLAG_IMPENETRABLE) flags |= TAISEI_SIM_ENEMY_FLAG_IMPENETRABLE;
++    if(e->flags & EFLAG_NO_AUTOKILL) flags |= TAISEI_SIM_ENEMY_FLAG_NO_AUTOKILL;
++    return flags;
++}
++
++static uint32_t count_projectiles(void) {
++    uint32_t count = 0;
++    for(Projectile *p = global.projs.first; p; p = p->next) {
++        if(p->type != PROJ_PARTICLE) {
++            ++count;
++        }
++    }
++    return count;
++}
++
++static uint32_t count_enemies(void) {
++    uint32_t count = 0;
++    for(Enemy *e = global.enemies.first; e; e = e->next) {
++        ++count;
++    }
++    return count;
++}
++
++static uint32_t count_items(void) {
++    uint32_t count = 0;
++    for(Item *item = global.items.first; item; item = item->next) {
++        ++count;
++    }
++    return count;
++}
++
++static uint32_t count_lasers(void) {
++    uint32_t count = 0;
++    for(Laser *laser = global.lasers.first; laser; laser = laser->next) {
++        ++count;
++    }
++    return count;
++}
++
++typedef struct LaserTraceContext {
++    TaiseiSim *sim;
++    uint32_t count;
++} LaserTraceContext;
++
++static void *collect_laser_point(Laser *laser, const LaserTraceSample *sample, void *userdata) {
++    (void)laser;
++    LaserTraceContext *ctx = userdata;
++    TaiseiSim *sim = ctx->sim;
++    uint32_t index = ctx->count++;
++
++    sim->laser_points = grow_array(
++        sim->laser_points,
++        &sim->laser_point_capacity,
++        ctx->count,
++        sizeof(*sim->laser_points)
++    );
++
++    float t = sample->segment_param;
++    float width = sample->segment->width.a + (sample->segment->width.b - sample->segment->width.a) * t;
++    sim->laser_points[index] = (TaiseiSimLaserPoint) {
++        .position = vec2_from_complex(sample->pos),
++        .half_width = width * 0.5f,
++        .time = sample->segment->time.a + (sample->segment->time.b - sample->segment->time.a) * t,
++        .flags = sample->discontinuous ? TAISEI_SIM_LASER_POINT_FLAG_DISCONTINUITY : 0u,
++    };
++
++    // NOTE (local fix, 2026-09-25): must return NULL to continue the trace.
++    // laser_trace() stops at the first non-NULL callback result; returning
++    // userdata truncated every laser to its first sample point, so laser
++    // beam bodies were missing from the snapshot (breaking hazard models
++    // built on laser_points).
++    return NULL;
++}
++
++static void build_snapshot(TaiseiSim *sim) {
++    TaiseiSimState *state = &sim->snapshot;
++    *state = (TaiseiSimState) {
++        .struct_size = sizeof(*state),
++        .api_version = TAISEI_SIM_API_VERSION,
++        .episode_status = sim->status,
++        .initial_rng_seed = sim->initial_seed,
++        .start_time = sim->start_time,
++        .gameover_frame = global.gameover_time,
++    };
++
++    if(global.stage) {
++        state->stage_id = global.stage->id;
++        state->stage_type = stage_type(global.stage->type);
++    }
++
++    state->difficulty = global.diff;
++    state->practice_mode = global.is_practice_mode;
++    state->logical_frame = global.frames;
++    state->stage_clear = stage_is_cleared() || sim->status == TAISEI_SIM_STATUS_WON;
++    state->game_over = sim->status == TAISEI_SIM_STATUS_LOST;
++    state->score = global.plr.points;
++    state->graze = global.plr.graze;
++    state->voltage = global.plr.voltage;
++    state->deaths = global.plr.stats.stage.lives_used;
++    state->bombs_used = global.plr.stats.stage.bombs_used;
++    state->continues_used = global.plr.stats.stage.continues_used;
++
++    Player *player = &global.plr;
++    state->player = (TaiseiSimPlayerState) {
++        .position = vec2_from_complex(player->pos),
++        .previous_position = sim->previous_player_position,
++        .velocity = vec2_from_complex(player->velocity),
++        .input_flags = input_flags(player->inputflags),
++        .focused = !!(player->inputflags & INFLAG_FOCUS),
++        .shooting = !!(player->inputflags & INFLAG_SHOT),
++        .lives = player->lives,
++        .bombs = player->bombs,
++        .life_fragments = player->life_fragments,
++        .bomb_fragments = player->bomb_fragments,
++        .stored_power = player->power_stored,
++        .effective_power = player_get_effective_power(player),
++        .point_item_value = player->point_item_value,
++        .score = player->points,
++        .graze = player->graze,
++        .voltage = player->voltage,
++        .invulnerable = !player_is_vulnerable(player),
++        .recovering = player_is_recovering(player),
++        .alive = player_is_alive(player),
++        .death_timer = player->deathtime >= 0 ? player->deathtime - global.frames : -1,
++        .respawn_timer = player->respawntime > global.frames ? player->respawntime - global.frames : 0,
++        .recovery_timer = player->recoverytime > global.frames ? player->recoverytime - global.frames : 0,
++        .bomb_active = player_is_bomb_active(player),
++        .bomb_progress = player_get_bomb_progress(player),
++        .bomb_trigger_frame = player->bomb_triggertime,
++        .bomb_end_frame = player->bomb_endtime,
++        .power_surge_active = player_is_powersurge_active(player),
++        .power_surge_positive = player->powersurge.positive,
++        .power_surge_negative = player->powersurge.negative,
++    };
++
++    if(player->mode) {
++        state->player.player_character = player->mode->character->id;
++        state->player.shot_mode = player->mode->shot_mode;
++        state->player_character = player->mode->character->id;
++        state->shot_mode = player->mode->shot_mode;
++    }
++
++    fill_boss_state(sim, &state->boss);
++
++    state->projectile_count = count_projectiles();
++    sim->projectiles = grow_array(sim->projectiles, &sim->projectile_capacity, state->projectile_count, sizeof(*sim->projectiles));
++    uint32_t pi = 0;
++    for(Projectile *p = global.projs.first; p; p = p->next) {
++        if(p->type == PROJ_PARTICLE) {
++            continue;
++        }
++        sim->projectiles[pi++] = (TaiseiSimProjectileState) {
++            .spawn_id = p->ent.spawn_id,
++            .category = projectile_category(p),
++            .position = vec2_from_complex(p->pos),
++            .previous_position = vec2_from_complex(p->prevpos),
++            .velocity = vec2_from_complex(p->move.velocity),
++            .collision_size = vec2_from_complex(p->collision_size),
++            .damage = p->damage,
++            .angle = p->angle,
++            .age_frames = global.frames - p->birthtime,
++            .flags = projectile_flags(p),
++            .damage_type = damage_type(p->damage_type),
++            .clear_flags = clear_flags(p->clear_flags),
++        };
++    }
++    if(state->projectile_count > 1) {
++        qsort(sim->projectiles, state->projectile_count, sizeof(*sim->projectiles), compare_projectiles);
++    }
++
++    state->enemy_count = count_enemies();
++    sim->enemies = grow_array(sim->enemies, &sim->enemy_capacity, state->enemy_count, sizeof(*sim->enemies));
++    uint32_t ei = 0;
++    for(Enemy *e = global.enemies.first; e; e = e->next) {
++        sim->enemies[ei++] = (TaiseiSimEnemyState) {
++            .spawn_id = e->ent.spawn_id,
++            .position = vec2_from_complex(e->pos),
++            .velocity = vec2_from_complex(e->move.velocity),
++            .hp = e->hp,
++            .max_hp = e->spawn_hp,
++            .hit_radius = e->hit_radius,
++            .hurt_radius = e->hurt_radius,
++            .age_frames = global.frames - e->birthtime,
++            .flags = enemy_flags(e),
++            .damageable = enemy_is_vulnerable(e),
++            .harmful = !(e->flags & EFLAG_NO_HURT),
++        };
++    }
++    if(state->enemy_count > 1) {
++        qsort(sim->enemies, state->enemy_count, sizeof(*sim->enemies), compare_enemies);
++    }
++
++    state->item_count = count_items();
++    sim->items = grow_array(sim->items, &sim->item_capacity, state->item_count, sizeof(*sim->items));
++    uint32_t ii = 0;
++    for(Item *item = global.items.first; item; item = item->next) {
++        sim->items[ii++] = (TaiseiSimItemState) {
++            .spawn_id = item->ent.spawn_id,
++            .position = vec2_from_complex(item->pos),
++            .velocity = vec2_from_complex(item->v),
++            .item_type = item_type(item->type),
++            .age_frames = global.frames - item->birthtime,
++            .collect_frame = item->collecttime,
++            .attracted = item->auto_collect || item->collecttime > 0,
++            .pickup_value = item->pickup_value,
++        };
++    }
++    if(state->item_count > 1) {
++        qsort(sim->items, state->item_count, sizeof(*sim->items), compare_items);
++    }
++
++    state->laser_count = count_lasers();
++    sim->lasers = grow_array(sim->lasers, &sim->laser_capacity, state->laser_count, sizeof(*sim->lasers));
++    Laser **laser_ptrs = state->laser_count ? mem_alloc_array(state->laser_count, sizeof(*laser_ptrs)) : NULL;
++    uint32_t li = 0;
++    for(Laser *laser = global.lasers.first; laser; laser = laser->next) {
++        laser_ptrs[li++] = laser;
++    }
++    if(state->laser_count > 1) {
++        qsort(laser_ptrs, state->laser_count, sizeof(*laser_ptrs), compare_laser_ptrs);
++    }
++
++    uint32_t laser_point_count = 0;
++    for(li = 0; li < state->laser_count; ++li) {
++        Laser *laser = laser_ptrs[li];
++        uint32_t first_point = laser_point_count;
++        LaserTraceContext trace = { .sim = sim, .count = laser_point_count };
++        laser_trace(laser, sim->laser_sample_step, collect_laser_point, &trace);
++        laser_point_count = trace.count;
++
++        sim->lasers[li] = (TaiseiSimLaserState) {
++            .spawn_id = laser->ent.spawn_id,
++            .origin = vec2_from_complex(laser->pos),
++            .age_frames = global.frames - laser->birthtime,
++            .width = laser->width,
++            .speed = laser->speed,
++            .timespan = laser->timespan,
++            .death_time = laser->deathtime,
++            .time_shift = laser->timeshift,
++            .collision_active = laser->collision_active,
++            .unclearable = laser->unclearable,
++            .clear_flags = clear_flags(laser->clear_flags),
++            .first_point = first_point,
++            .point_count = laser_point_count - first_point,
++        };
++    }
++    mem_free(laser_ptrs);
++    state->laser_point_count = laser_point_count;
++
++    uint64_t digest = UINT64_C(14695981039346656037);
++    #define DIGEST_SCALAR(value) do { \
++        typeof(value) digest_value = (value); \
++        digest = digest_bytes(digest, &digest_value, sizeof(digest_value)); \
++    } while(0)
++    #define DIGEST_VEC(value) do { \
++        DIGEST_SCALAR((value).x); \
++        DIGEST_SCALAR((value).y); \
++    } while(0)
++
++    DIGEST_SCALAR(state->stage_id);
++    DIGEST_SCALAR(state->stage_type);
++    DIGEST_SCALAR(state->difficulty);
++    DIGEST_SCALAR(state->practice_mode);
++    DIGEST_SCALAR(state->logical_frame);
++    DIGEST_SCALAR(state->initial_rng_seed);
++    DIGEST_SCALAR(state->episode_status);
++    DIGEST_SCALAR(state->stage_clear);
++    DIGEST_SCALAR(state->game_over);
++    DIGEST_SCALAR(state->score);
++    DIGEST_SCALAR(state->graze);
++    DIGEST_SCALAR(state->voltage);
++    DIGEST_SCALAR(state->deaths);
++    DIGEST_SCALAR(state->bombs_used);
++    DIGEST_SCALAR(state->continues_used);
++
++    DIGEST_VEC(state->player.position);
++    DIGEST_VEC(state->player.velocity);
++    DIGEST_SCALAR(state->player.input_flags);
++    DIGEST_SCALAR(state->player.lives);
++    DIGEST_SCALAR(state->player.bombs);
++    DIGEST_SCALAR(state->player.life_fragments);
++    DIGEST_SCALAR(state->player.bomb_fragments);
++    DIGEST_SCALAR(state->player.stored_power);
++    DIGEST_SCALAR(state->player.effective_power);
++    DIGEST_SCALAR(state->player.point_item_value);
++    DIGEST_SCALAR(state->player.score);
++    DIGEST_SCALAR(state->player.graze);
++    DIGEST_SCALAR(state->player.voltage);
++    DIGEST_SCALAR(state->player.invulnerable);
++    DIGEST_SCALAR(state->player.recovering);
++    DIGEST_SCALAR(state->player.alive);
++    DIGEST_SCALAR(state->player.death_timer);
++    DIGEST_SCALAR(state->player.respawn_timer);
++    DIGEST_SCALAR(state->player.recovery_timer);
++    DIGEST_SCALAR(state->player.bomb_active);
++    DIGEST_SCALAR(state->player.bomb_trigger_frame);
++    DIGEST_SCALAR(state->player.bomb_end_frame);
++    DIGEST_SCALAR(state->player.power_surge_active);
++    DIGEST_SCALAR(state->player.power_surge_positive);
++    DIGEST_SCALAR(state->player.power_surge_negative);
++    DIGEST_SCALAR(state->player.player_character);
++    DIGEST_SCALAR(state->player.shot_mode);
++
++    DIGEST_SCALAR(state->boss.active);
++    DIGEST_VEC(state->boss.position);
++    DIGEST_VEC(state->boss.velocity);
++    DIGEST_SCALAR(state->boss.hp);
++    DIGEST_SCALAR(state->boss.max_hp);
++    DIGEST_SCALAR(state->boss.invulnerable);
++    DIGEST_SCALAR(state->boss.phase_index);
++    DIGEST_SCALAR(state->boss.phase_type);
++    DIGEST_SCALAR(state->boss.attack_id);
++    DIGEST_SCALAR(state->boss.spell_id);
++    DIGEST_SCALAR(state->boss.spell_active);
++    DIGEST_SCALAR(state->boss.phase_start_frame);
++    DIGEST_SCALAR(state->boss.phase_end_frame);
++    DIGEST_SCALAR(state->boss.phase_timeout_frames);
++    DIGEST_SCALAR(state->boss.remaining_timeout_frames);
++    DIGEST_SCALAR(state->boss.spell_failed_frame);
++    DIGEST_SCALAR(state->boss.spell_failed);
++
++    DIGEST_SCALAR(state->projectile_count);
++    for(uint32_t i = 0; i < state->projectile_count; ++i) {
++        TaiseiSimProjectileState *p = &sim->projectiles[i];
++        DIGEST_SCALAR(p->spawn_id);
++        DIGEST_SCALAR(p->category);
++        DIGEST_VEC(p->position);
++        DIGEST_VEC(p->previous_position);
++        DIGEST_VEC(p->velocity);
++        DIGEST_VEC(p->collision_size);
++        DIGEST_SCALAR(p->damage);
++        DIGEST_SCALAR(p->angle);
++        DIGEST_SCALAR(p->age_frames);
++        DIGEST_SCALAR(p->flags);
++        DIGEST_SCALAR(p->damage_type);
++        DIGEST_SCALAR(p->clear_flags);
++    }
++
++    DIGEST_SCALAR(state->enemy_count);
++    for(uint32_t i = 0; i < state->enemy_count; ++i) {
++        TaiseiSimEnemyState *e = &sim->enemies[i];
++        DIGEST_SCALAR(e->spawn_id);
++        DIGEST_VEC(e->position);
++        DIGEST_VEC(e->velocity);
++        DIGEST_SCALAR(e->hp);
++        DIGEST_SCALAR(e->max_hp);
++        DIGEST_SCALAR(e->hit_radius);
++        DIGEST_SCALAR(e->hurt_radius);
++        DIGEST_SCALAR(e->age_frames);
++        DIGEST_SCALAR(e->flags);
++        DIGEST_SCALAR(e->damageable);
++        DIGEST_SCALAR(e->harmful);
++    }
++
++    DIGEST_SCALAR(state->item_count);
++    for(uint32_t i = 0; i < state->item_count; ++i) {
++        TaiseiSimItemState *item = &sim->items[i];
++        DIGEST_SCALAR(item->spawn_id);
++        DIGEST_VEC(item->position);
++        DIGEST_VEC(item->velocity);
++        DIGEST_SCALAR(item->item_type);
++        DIGEST_SCALAR(item->age_frames);
++        DIGEST_SCALAR(item->collect_frame);
++        DIGEST_SCALAR(item->attracted);
++        DIGEST_SCALAR(item->pickup_value);
++    }
++
++    DIGEST_SCALAR(state->laser_count);
++    for(uint32_t i = 0; i < state->laser_count; ++i) {
++        TaiseiSimLaserState *laser = &sim->lasers[i];
++        DIGEST_SCALAR(laser->spawn_id);
++        DIGEST_VEC(laser->origin);
++        DIGEST_SCALAR(laser->age_frames);
++        DIGEST_SCALAR(laser->width);
++        DIGEST_SCALAR(laser->speed);
++        DIGEST_SCALAR(laser->timespan);
++        DIGEST_SCALAR(laser->death_time);
++        DIGEST_SCALAR(laser->time_shift);
++        DIGEST_SCALAR(laser->collision_active);
++        DIGEST_SCALAR(laser->unclearable);
++        DIGEST_SCALAR(laser->clear_flags);
++        DIGEST_SCALAR(laser->point_count);
++    }
++
++    DIGEST_SCALAR(state->laser_point_count);
++    for(uint32_t i = 0; i < state->laser_point_count; ++i) {
++        TaiseiSimLaserPoint *point = &sim->laser_points[i];
++        DIGEST_VEC(point->position);
++        DIGEST_SCALAR(point->half_width);
++        DIGEST_SCALAR(point->time);
++        DIGEST_SCALAR(point->flags);
++    }
++
++    #undef DIGEST_VEC
++    #undef DIGEST_SCALAR
++    state->gameplay_digest = digest;
++}
++
++#define INFLAGS_SIM_CONTROLLED (INFLAGS_MOVE | INFLAG_FOCUS | INFLAG_SHOT)
++
++static void sim_input_hook(void *userdata) {
++    TaiseiSim *sim = userdata;
++    static const struct {
++        uint32_t button;
++        KeyIndex key;
++    } mappings[] = {
++        { TAISEI_SIM_ACTION_UP, KEY_UP },
++        { TAISEI_SIM_ACTION_DOWN, KEY_DOWN },
++        { TAISEI_SIM_ACTION_LEFT, KEY_LEFT },
++        { TAISEI_SIM_ACTION_RIGHT, KEY_RIGHT },
++        { TAISEI_SIM_ACTION_FOCUS, KEY_FOCUS },
++        { TAISEI_SIM_ACTION_SHOT, KEY_SHOT },
++        { TAISEI_SIM_ACTION_BOMB, KEY_BOMB },
++        { TAISEI_SIM_ACTION_SPECIAL, KEY_SPECIAL },
++    };
++
++    uint32_t changed = sim->desired_buttons ^ sim->applied_buttons;
++    for(size_t i = 0; i < sizeof(mappings) / sizeof(mappings[0]); ++i) {
++        if(!(changed & mappings[i].button)) {
++            continue;
++        }
++
++        bool pressed = sim->desired_buttons & mappings[i].button;
++        player_event(
++            &global.plr,
++            NULL,
++            &global.replay.output,
++            pressed ? EV_PRESS : EV_RELEASE,
++            mappings[i].key
++        );
++    }
++
++    PlrInputFlag continuous = 0;
++    if(sim->desired_buttons & TAISEI_SIM_ACTION_UP) continuous |= INFLAG_UP;
++    if(sim->desired_buttons & TAISEI_SIM_ACTION_DOWN) continuous |= INFLAG_DOWN;
++    if(sim->desired_buttons & TAISEI_SIM_ACTION_LEFT) continuous |= INFLAG_LEFT;
++    if(sim->desired_buttons & TAISEI_SIM_ACTION_RIGHT) continuous |= INFLAG_RIGHT;
++    if(sim->desired_buttons & TAISEI_SIM_ACTION_FOCUS) continuous |= INFLAG_FOCUS;
++    if(sim->desired_buttons & TAISEI_SIM_ACTION_SHOT) continuous |= INFLAG_SHOT;
++
++    PlrInputFlag reconciled = (global.plr.inputflags & ~INFLAGS_SIM_CONTROLLED) | continuous;
++    if(reconciled != global.plr.inputflags) {
++        player_event(&global.plr, NULL, &global.replay.output, EV_INFLAGS, reconciled);
++    }
++
++    sim->applied_buttons = sim->desired_buttons;
++}
++
++static void sim_stage_finished(CallChainResult ccr) {
++    TaiseiSim *sim = ccr.ctx;
++    sim->episode_active = false;
++    sim->replay_complete = true;
++    switch(global.gameover) {
++        case GAMEOVER_WIN:
++        case GAMEOVER_SCORESCREEN:
++            sim->status = TAISEI_SIM_STATUS_WON;
++            break;
++        case GAMEOVER_DEFEAT:
++            sim->status = TAISEI_SIM_STATUS_LOST;
++            break;
++        default:
++            sim->status = TAISEI_SIM_STATUS_ABORTED;
++            break;
++    }
++}
++
++static TaiseiSimResult abort_active_episode(TaiseiSim *sim) {
++    if(!sim->episode_active) {
++        return TAISEI_SIM_OK;
++    }
++
++    sim->desired_buttons = 0;
++
++    // stage_enter() starts the loop before the stage has began's code.
++    // So we run that first frame before requesting an abort so it is okay and well.
++    if(global.frames == 0 && eventloop_is_active()) {
++        eventloop_step_logic();
++    }
++
++    if(!sim->episode_active || !eventloop_is_active()) {
++        return TAISEI_SIM_OK;
++    }
++
++    stage_finish(GAMEOVER_ABORT);
++
++    for(uint32_t i = 0; i < SIM_ABORT_FRAME_LIMIT && eventloop_is_active(); ++i) {
++        eventloop_step_logic();
++    }
++
++    if(eventloop_is_active()) {
++        return set_error(sim, TAISEI_SIM_ERROR_INTERNAL, "Active stage did not stop");
++    }
++
++    return TAISEI_SIM_OK;
++}
++
++uint32_t taisei_sim_api_version(void) {
++    return TAISEI_SIM_API_VERSION;
++}
++
++static uint64_t abi_hash_u64(uint64_t hash, uint64_t value) {
++    for(uint32_t i = 0; i < 8; ++i) {
++        hash ^= (value >> (i * 8)) & UINT64_C(0xff);
++        hash *= UINT64_C(1099511628211);
++    }
++    return hash;
++}
++
++uint64_t taisei_sim_abi_fingerprint(void) {
++    static const uint64_t values[] = {
++        TAISEI_SIM_API_VERSION,
++        (uint64_t)(int64_t)TAISEI_SIM_OK,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_INVALID_ARGUMENT,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_INVALID_HANDLE,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_NOT_INITIALIZED,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_ALREADY_INITIALIZED,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_SIMULATION_ACTIVE,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_NO_ACTIVE_EPISODE,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_EPISODE_RUNNING,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_EPISODE_TERMINAL,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_STAGE_NOT_FOUND,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_PLAYER_MODE_NOT_FOUND,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_BUFFER_TOO_SMALL,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_IO,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_ABI_MISMATCH,
++        (uint64_t)(int64_t)TAISEI_SIM_ERROR_INTERNAL,
++        TAISEI_SIM_STATUS_INVALID,
++        TAISEI_SIM_STATUS_RUNNING,
++        TAISEI_SIM_STATUS_WON,
++        TAISEI_SIM_STATUS_LOST,
++        TAISEI_SIM_STATUS_ABORTED,
++        TAISEI_SIM_STATUS_ERROR,
++        TAISEI_SIM_DIFFICULTY_DEFAULT,
++        TAISEI_SIM_DIFFICULTY_EASY,
++        TAISEI_SIM_DIFFICULTY_NORMAL,
++        TAISEI_SIM_DIFFICULTY_HARD,
++        TAISEI_SIM_DIFFICULTY_LUNATIC,
++        TAISEI_SIM_STAGE_UNKNOWN,
++        TAISEI_SIM_STAGE_STORY,
++        TAISEI_SIM_STAGE_EXTRA,
++        TAISEI_SIM_STAGE_SPELL,
++        TAISEI_SIM_STAGE_SPECIAL,
++        TAISEI_SIM_BOSS_PHASE_NONE,
++        TAISEI_SIM_BOSS_PHASE_NONSPELL,
++        TAISEI_SIM_BOSS_PHASE_MOVE,
++        TAISEI_SIM_BOSS_PHASE_SPELL,
++        TAISEI_SIM_BOSS_PHASE_SURVIVAL,
++        TAISEI_SIM_BOSS_PHASE_EXTRA,
++        TAISEI_SIM_ACTION_UP,
++        TAISEI_SIM_ACTION_DOWN,
++        TAISEI_SIM_ACTION_LEFT,
++        TAISEI_SIM_ACTION_RIGHT,
++        TAISEI_SIM_ACTION_FOCUS,
++        TAISEI_SIM_ACTION_SHOT,
++        TAISEI_SIM_ACTION_BOMB,
++        TAISEI_SIM_ACTION_SPECIAL,
++        TAISEI_SIM_ACTION_ALL,
++        TAISEI_SIM_INPUT_UP,
++        TAISEI_SIM_INPUT_DOWN,
++        TAISEI_SIM_INPUT_LEFT,
++        TAISEI_SIM_INPUT_RIGHT,
++        TAISEI_SIM_INPUT_FOCUS,
++        TAISEI_SIM_INPUT_SHOT,
++        TAISEI_SIM_INPUT_SKIP,
++        TAISEI_SIM_PROJECTILE_INVALID,
++        TAISEI_SIM_PROJECTILE_ENEMY,
++        TAISEI_SIM_PROJECTILE_CLEARING,
++        TAISEI_SIM_PROJECTILE_PLAYER,
++        TAISEI_SIM_DAMAGE_UNDEFINED,
++        TAISEI_SIM_DAMAGE_ENEMY_SHOT,
++        TAISEI_SIM_DAMAGE_ENEMY_COLLISION,
++        TAISEI_SIM_DAMAGE_PLAYER_SHOT,
++        TAISEI_SIM_DAMAGE_PLAYER_BOMB,
++        TAISEI_SIM_DAMAGE_PLAYER_DISCHARGE,
++        TAISEI_SIM_PROJECTILE_FLAG_GRAZEABLE,
++        TAISEI_SIM_PROJECTILE_FLAG_CLEARABLE,
++        TAISEI_SIM_PROJECTILE_FLAG_COLLISION_ENABLED,
++        TAISEI_SIM_PROJECTILE_FLAG_INDESTRUCTIBLE,
++        TAISEI_SIM_PROJECTILE_FLAG_ACTIVE_HAZARD,
++        TAISEI_SIM_ENEMY_FLAG_KILLED,
++        TAISEI_SIM_ENEMY_FLAG_TARGETABLE,
++        TAISEI_SIM_ENEMY_FLAG_DAMAGEABLE,
++        TAISEI_SIM_ENEMY_FLAG_HARMFUL,
++        TAISEI_SIM_ENEMY_FLAG_INVULNERABLE,
++        TAISEI_SIM_ENEMY_FLAG_IMPENETRABLE,
++        TAISEI_SIM_ENEMY_FLAG_NO_AUTOKILL,
++        TAISEI_SIM_CLEAR_FLAG_BULLETS,
++        TAISEI_SIM_CLEAR_FLAG_LASERS,
++        TAISEI_SIM_CLEAR_FLAG_FORCED,
++        TAISEI_SIM_CLEAR_FLAG_IMMEDIATE,
++        TAISEI_SIM_CLEAR_FLAG_SPAWNS_VOLTAGE,
++        TAISEI_SIM_LASER_POINT_FLAG_DISCONTINUITY,
++        TAISEI_SIM_ITEM_PIV,
++        TAISEI_SIM_ITEM_POINTS,
++        TAISEI_SIM_ITEM_POWER_MINI,
++        TAISEI_SIM_ITEM_POWER,
++        TAISEI_SIM_ITEM_SURGE,
++        TAISEI_SIM_ITEM_VOLTAGE,
++        TAISEI_SIM_ITEM_BOMB_FRAGMENT,
++        TAISEI_SIM_ITEM_LIFE_FRAGMENT,
++        TAISEI_SIM_ITEM_BOMB,
++        TAISEI_SIM_ITEM_LIFE,
++        sizeof(TaiseiSimVec2),
++        sizeof(TaiseiSimGlobalConfig),
++        sizeof(TaiseiSimConfig),
++        sizeof(TaiseiSimEpisodeConfig),
++        sizeof(TaiseiSimAction),
++        sizeof(TaiseiSimPlayerState),
++        sizeof(TaiseiSimBossState),
++        sizeof(TaiseiSimProjectileState),
++        sizeof(TaiseiSimEnemyState),
++        sizeof(TaiseiSimItemState),
++        sizeof(TaiseiSimLaserState),
++        sizeof(TaiseiSimLaserPoint),
++        sizeof(TaiseiSimState),
++        sizeof(TaiseiSimStateBuffers),
++    };
++
++    uint64_t hash = UINT64_C(14695981039346656037);
++    for(size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++        hash = abi_hash_u64(hash, values[i]);
++    }
++    return hash;
++}
++
++TaiseiSimResult taisei_sim_global_init(const TaiseiSimGlobalConfig *config) {
++    if(config == NULL) {
++        return set_error(NULL, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Global configuration is null");
++    }
++    if(!struct_is_compatible(config->struct_size, sizeof(*config)) || config->api_version != TAISEI_SIM_API_VERSION) {
++        return set_error(NULL, TAISEI_SIM_ERROR_ABI_MISMATCH, "Global configuration size or API version does not match");
++    }
++    if(config->flags != 0 || config->reserved != 0) {
++        return set_error(NULL, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Unknown global simulation flags");
++    }
++    if(library_initialized) {
++        return set_error(NULL, TAISEI_SIM_ERROR_ALREADY_INITIALIZED, "Simulation is already inited");
++    }
++
++    TaiseiSimResult result = taisei_sim_runtime_init(config, global_error, sizeof(global_error));
++    if(result == TAISEI_SIM_OK) {
++        library_initialized = true;
++    }
++    return result;
++}
++
++TaiseiSimResult taisei_sim_global_shutdown(void) {
++    if(!library_initialized) {
++        return TAISEI_SIM_OK;
++    }
++    if(active_sim) {
++        return set_error(active_sim, TAISEI_SIM_ERROR_SIMULATION_ACTIVE, "Please distroy the active simulation before shutdown");
++    }
++
++    taisei_sim_runtime_shutdown();
++    library_initialized = false;
++    return TAISEI_SIM_OK;
++}
++
++TaiseiSimResult taisei_sim_create(const TaiseiSimConfig *config, TaiseiSim **out_sim) {
++    if(!library_initialized) {
++        return set_error(NULL, TAISEI_SIM_ERROR_NOT_INITIALIZED, "Call taisei_sim_global_init first");
++    }
++    if(out_sim) {
++        *out_sim = NULL;
++    }
++    if(config == NULL || out_sim == NULL || !struct_is_compatible(config->struct_size, sizeof(*config))) {
++        return set_error(NULL, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Invalid simulation cfg or pointer");
++    }
++    if(config->flags != 0 || config->reserved != 0 || !isfinite(config->laser_sample_step)) {
++        return set_error(NULL, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Unknown sim flags, nonzero reserved field, or invalid laser sample step");
++    }
++    if(active_sim) {
++        return set_error(active_sim, TAISEI_SIM_ERROR_SIMULATION_ACTIVE, "Only one simulation is supported per process. Use `multiprocessing` or `std::process::Command`");
++    }
++
++    TaiseiSim *sim = ALLOC(TaiseiSim, {
++        .status = TAISEI_SIM_STATUS_INVALID,
++        .laser_sample_step = config->laser_sample_step > 0 ? config->laser_sample_step : 8.0,
++    });
++    res_group_init(&sim->resources);
++    stage_set_external_input_hook(sim_input_hook, sim);
++    active_sim = sim;
++    *out_sim = sim;
++    return TAISEI_SIM_OK;
++}
++
++TaiseiSimResult taisei_sim_reset(TaiseiSim *sim, const TaiseiSimEpisodeConfig *episode) {
++    TaiseiSimResult valid = validate_sim(sim);
++    if(valid != TAISEI_SIM_OK) {
++        return valid;
++    }
++    if(episode == NULL || !struct_is_compatible(episode->struct_size, sizeof(*episode))) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Episode config invalid");
++    }
++    if(episode->reserved0 != 0 || episode->reserved1 != 0 || episode->practice_mode > 1) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Reserved episode fields must be zero and practice_mode must be 0 or 1");
++    }
++
++    TaiseiSimResult aborted = abort_active_episode(sim);
++    if(aborted != TAISEI_SIM_OK) {
++        return aborted;
++    }
++
++    // Just like we done before, and also like what we done to th05 mystic square (nmlgc/rec98),
++    // th04 lotus land story (nmlgc/rec98), even th06-portable (GensokyoClub/th06)...
++    // So it is really clear how to write the code and without Segmentation Fault.
++    res_group_release(&sim->resources);
++    res_group_init(&sim->resources);
++
++    StageInfo *stage = stageinfo_get_by_id(episode->stage_id);
++    if(!stage) {
++        return set_error(sim, TAISEI_SIM_ERROR_STAGE_NOT_FOUND, "Unknown stage ID");
++    }
++
++    PlayerMode *mode = plrmode_find(episode->player_character, episode->shot_mode);
++    if(!mode) {
++        return set_error(sim, TAISEI_SIM_ERROR_PLAYER_MODE_NOT_FOUND, "Unknown player character or shot type");
++    }
++
++    Difficulty difficulty = episode->difficulty ? episode->difficulty : (stage->difficulty ? stage->difficulty : D_Easy);
++    if(difficulty < D_Easy || difficulty > D_Lunatic) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Rank must be in a selectable range");
++    }
++
++    if(
++        (episode->initial_lives != TAISEI_SIM_USE_DEFAULT_I32 && (episode->initial_lives < 0 || episode->initial_lives > PLR_MAX_LIVES)) ||
++        (episode->initial_bombs != TAISEI_SIM_USE_DEFAULT_I32 && (episode->initial_bombs < 0 || episode->initial_bombs > PLR_MAX_BOMBS)) ||
++        (episode->initial_life_fragments != TAISEI_SIM_USE_DEFAULT_I32 && (episode->initial_life_fragments < 0 || episode->initial_life_fragments > PLR_MAX_LIFE_FRAGMENTS)) ||
++        (episode->initial_bomb_fragments != TAISEI_SIM_USE_DEFAULT_I32 && (episode->initial_bomb_fragments < 0 || episode->initial_bomb_fragments > PLR_MAX_BOMB_FRAGMENTS)) ||
++        (episode->initial_power != TAISEI_SIM_USE_DEFAULT_I32 && (episode->initial_power < 0 || episode->initial_power > PLR_MAX_POWER_STORED)) ||
++        (episode->initial_point_item_value != TAISEI_SIM_USE_DEFAULT_I32 && episode->initial_point_item_value < 0)
++    ) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Initial player resources are outside supported ranges. Consider use runtime injections to cheat");
++    }
++
++    replay_state_deinit(&global.replay.input);
++    replay_state_deinit(&global.replay.output);
++    if(sim->replay_initialized) {
++        replay_reset(&sim->replay);
++    }
++    sim->replay_initialized = true;
++    sim->replay.playername = mem_strdup("thrl");
++    replay_state_init_record(&global.replay.output, &sim->replay);
++
++    global.gameover = GAMEOVER_NONE;
++    global.diff = difficulty;
++    global.is_practice_mode = episode->practice_mode || stage->type == STAGE_SPELL;
++
++    player_init(&global.plr);
++    stats_init(&global.plr.stats);
++    global.plr.mode = mode;
++
++    StageStartOverride override = {
++        .flags = STAGE_START_OVERRIDE_SEED | STAGE_START_OVERRIDE_START_TIME |
++                 STAGE_START_OVERRIDE_GRAZE,
++        .seed = episode->rng_seed,
++        .start_time = episode->start_time == TAISEI_SIM_USE_DEFAULT_U64 ? episode->rng_seed : episode->start_time,
++        .graze = episode->initial_graze,
++    };
++
++    if(episode->initial_lives != TAISEI_SIM_USE_DEFAULT_I32) {
++        override.flags |= STAGE_START_OVERRIDE_LIVES;
++        override.lives = episode->initial_lives;
++    }
++    if(episode->initial_bombs != TAISEI_SIM_USE_DEFAULT_I32) {
++        override.flags |= STAGE_START_OVERRIDE_BOMBS;
++        override.bombs = episode->initial_bombs;
++    }
++    if(episode->initial_life_fragments != TAISEI_SIM_USE_DEFAULT_I32) {
++        override.flags |= STAGE_START_OVERRIDE_LIFE_FRAGMENTS;
++        override.life_fragments = episode->initial_life_fragments;
++    }
++    if(episode->initial_bomb_fragments != TAISEI_SIM_USE_DEFAULT_I32) {
++        override.flags |= STAGE_START_OVERRIDE_BOMB_FRAGMENTS;
++        override.bomb_fragments = episode->initial_bomb_fragments;
++    }
++    if(episode->initial_power != TAISEI_SIM_USE_DEFAULT_I32) {
++        override.flags |= STAGE_START_OVERRIDE_POWER;
++        override.power = episode->initial_power;
++    }
++    if(episode->initial_point_item_value != TAISEI_SIM_USE_DEFAULT_I32) {
++        override.flags |= STAGE_START_OVERRIDE_PIV;
++        override.point_item_value = episode->initial_point_item_value;
++    }
++    if(episode->initial_score != TAISEI_SIM_USE_DEFAULT_U64) {
++        override.flags |= STAGE_START_OVERRIDE_SCORE;
++        override.score = episode->initial_score;
++    }
++
++    stage_set_start_override(&override);
++    sim->desired_buttons = 0;
++    sim->applied_buttons = 0;
++    sim->initial_seed = episode->rng_seed;
++    sim->start_time = override.start_time;
++    sim->status = TAISEI_SIM_STATUS_RUNNING;
++    sim->episode_active = true;
++    sim->replay_complete = false;
++    sim->recent_boss_damage = 0;
++    sim->previous_player_position = vec2_from_complex(global.plr.pos);
++    sim->error[0] = 0;
++
++    stage_enter(stage, &sim->resources, CALLCHAIN(sim_stage_finished, sim));
++    if(!eventloop_is_active()) {
++        sim->episode_active = false;
++        sim->status = TAISEI_SIM_STATUS_ERROR;
++        return set_error(sim, TAISEI_SIM_ERROR_INTERNAL, "Taisei didn't reg stage event loop");
++    }
++
++    // This is the same initialization frame executed by what we played; it
++    // does not process an discrete action. The first taisei_sim_step() do this.
++    LogicFrameAction init_action = eventloop_step_logic();
++    if(init_action == LFRAME_STOP && sim->episode_active) {
++        sim->status = TAISEI_SIM_STATUS_ERROR;
++        return set_error(sim, TAISEI_SIM_ERROR_INTERNAL, "Stage stopped during its init frames");
++    }
++    sim->previous_player_position = vec2_from_complex(global.plr.pos);
++    return TAISEI_SIM_OK;
++}
++
++TaiseiSimResult taisei_sim_step(TaiseiSim *sim, const TaiseiSimAction *action, uint32_t frame_count) {
++    TaiseiSimResult valid = validate_sim(sim);
++    if(valid != TAISEI_SIM_OK) {
++        return valid;
++    }
++    if(action == NULL || !struct_is_compatible(action->struct_size, sizeof(*action))) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Action is null");
++    }
++    if(action->buttons & ~TAISEI_SIM_ACTION_ALL) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Action contains things");
++    }
++    if(!sim->episode_active) {
++        return set_error(sim, TAISEI_SIM_ERROR_EPISODE_TERMINAL, "Episode is not running, no actions could be taken");
++    }
++
++    sim->desired_buttons = action->buttons;
++    sim->recent_boss_damage = 0;
++
++    for(uint32_t i = 0; i < frame_count && sim->episode_active; ++i) {
++        sim->previous_player_position = vec2_from_complex(global.plr.pos);
++
++        Boss *before_boss = global.boss;
++        Attack *before_attack = before_boss ? before_boss->current : NULL;
++        float before_hp = before_attack ? before_attack->hp : 0;
++
++        LogicFrameAction loop_action = eventloop_step_logic();
++        if(loop_action == LFRAME_STOP && sim->episode_active) {
++            sim->status = TAISEI_SIM_STATUS_ERROR;
++            return set_error(sim, TAISEI_SIM_ERROR_INTERNAL, "Event stopped without completing");
++        }
++
++        Boss *after_boss = global.boss;
++        Attack *after_attack = after_boss ? after_boss->current : NULL;
++        if(before_boss && before_boss == after_boss && before_attack && before_attack == after_attack && after_attack->hp < before_hp) {
++            sim->recent_boss_damage += before_hp - after_attack->hp;
++        }
++    }
++
++    return TAISEI_SIM_OK;
++}
++
++TaiseiSimResult taisei_sim_abort(TaiseiSim *sim) {
++    TaiseiSimResult valid = validate_sim(sim);
++    if(valid != TAISEI_SIM_OK) {
++        return valid;
++    }
++    if(!sim->episode_active) {
++        return set_error(sim, TAISEI_SIM_ERROR_EPISODE_TERMINAL, "Episode is not running");
++    }
++    return abort_active_episode(sim);
++}
++
++TaiseiSimResult taisei_sim_get_state(TaiseiSim *sim, TaiseiSimState *out_state, const TaiseiSimStateBuffers *buffers) {
++    TaiseiSimResult valid = validate_sim(sim);
++    if(valid != TAISEI_SIM_OK) {
++        return valid;
++    }
++    if(out_state == NULL || !struct_is_compatible(out_state->struct_size, sizeof(*out_state))) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "State output is null");
++    }
++    if(buffers && (!struct_is_compatible(buffers->struct_size, sizeof(*buffers)) || buffers->reserved != 0)) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "State buffers structure is broken");
++    }
++    if(sim->status == TAISEI_SIM_STATUS_INVALID) {
++        return set_error(sim, TAISEI_SIM_ERROR_NO_ACTIVE_EPISODE, "Simulation status is invalid and cannot be recovered. Reset simulation");
++    }
++
++    build_snapshot(sim);
++    *out_state = sim->snapshot;
++
++    bool too_small = false;
++    if(sim->snapshot.projectile_count) {
++        if(!buffers || !buffers->projectiles || buffers->projectile_capacity < sim->snapshot.projectile_count) {
++            too_small = true;
++        } else {
++            memcpy(buffers->projectiles, sim->projectiles, sim->snapshot.projectile_count * sizeof(*sim->projectiles));
++        }
++    }
++    if(sim->snapshot.enemy_count) {
++        if(!buffers || !buffers->enemies || buffers->enemy_capacity < sim->snapshot.enemy_count) {
++            too_small = true;
++        } else {
++            memcpy(buffers->enemies, sim->enemies, sim->snapshot.enemy_count * sizeof(*sim->enemies));
++        }
++    }
++    if(sim->snapshot.item_count) {
++        if(!buffers || !buffers->items || buffers->item_capacity < sim->snapshot.item_count) {
++            too_small = true;
++        } else {
++            memcpy(buffers->items, sim->items, sim->snapshot.item_count * sizeof(*sim->items));
++        }
++    }
++    if(sim->snapshot.laser_count) {
++        if(!buffers || !buffers->lasers || buffers->laser_capacity < sim->snapshot.laser_count) {
++            too_small = true;
++        } else {
++            memcpy(buffers->lasers, sim->lasers, sim->snapshot.laser_count * sizeof(*sim->lasers));
++        }
++    }
++    if(sim->snapshot.laser_point_count) {
++        if(!buffers || !buffers->laser_points || buffers->laser_point_capacity < sim->snapshot.laser_point_count) {
++            too_small = true;
++        } else {
++            memcpy(buffers->laser_points, sim->laser_points, sim->snapshot.laser_point_count * sizeof(*sim->laser_points));
++        }
++    }
++
++    if(too_small) {
++        return set_error(sim, TAISEI_SIM_ERROR_BUFFER_TOO_SMALL, "One or more state buffers are too small. Read TaiseiSimState");
++    }
++
++    return TAISEI_SIM_OK;
++}
++
++TaiseiSimResult taisei_sim_save_replay(TaiseiSim *sim, const char *path) {
++    TaiseiSimResult valid = validate_sim(sim);
++    if(valid != TAISEI_SIM_OK) {
++        return valid;
++    }
++    if(path == NULL || !*path) {
++        return set_error(sim, TAISEI_SIM_ERROR_INVALID_ARGUMENT, "Replay path is null");
++    }
++    if(sim->status == TAISEI_SIM_STATUS_INVALID) {
++        return set_error(sim, TAISEI_SIM_ERROR_NO_ACTIVE_EPISODE, "Reset the simulation please");
++    }
++    if(sim->episode_active || !sim->replay_complete) {
++        return set_error(sim, TAISEI_SIM_ERROR_EPISODE_RUNNING, "Replay saved once after the episode terminates");
++    }
++    if(!replay_save_syspath(&sim->replay, path, REPLAY_STRUCT_VERSION_WRITE)) {
++        return set_error(sim, TAISEI_SIM_ERROR_IO, "Failed to save the replay, unknown reason");
++    }
++    return TAISEI_SIM_OK;
++}
++
++TaiseiSimResult taisei_sim_destroy(TaiseiSim *sim) {
++    TaiseiSimResult valid = validate_sim(sim);
++    if(valid != TAISEI_SIM_OK) {
++        return valid;
++    }
++
++    TaiseiSimResult aborted = abort_active_episode(sim);
++    if(aborted != TAISEI_SIM_OK) {
++        return aborted;
++    }
++
++    stage_set_external_input_hook(NULL, NULL);
++    replay_state_deinit(&global.replay.input);
++    replay_state_deinit(&global.replay.output);
++    if(sim->replay_initialized) {
++        replay_reset(&sim->replay);
++    }
++    res_group_release(&sim->resources);
++    mem_free(sim->projectiles);
++    mem_free(sim->enemies);
++    mem_free(sim->items);
++    mem_free(sim->lasers);
++    mem_free(sim->laser_points);
++    active_sim = NULL;
++    mem_free(sim);
++    return TAISEI_SIM_OK;
++}
++
++const char *taisei_sim_last_error(const TaiseiSim *sim) {
++    if(sim && sim == active_sim) {
++        return sim->error;
++    }
++    return global_error;
++}
++
++size_t taisei_sim_sizeof_vec2(void) { return sizeof(TaiseiSimVec2); }
++size_t taisei_sim_sizeof_global_config(void) { return sizeof(TaiseiSimGlobalConfig); }
++size_t taisei_sim_sizeof_config(void) { return sizeof(TaiseiSimConfig); }
++size_t taisei_sim_sizeof_episode_config(void) { return sizeof(TaiseiSimEpisodeConfig); }
++size_t taisei_sim_sizeof_action(void) { return sizeof(TaiseiSimAction); }
++size_t taisei_sim_sizeof_state(void) { return sizeof(TaiseiSimState); }
++size_t taisei_sim_sizeof_state_buffers(void) { return sizeof(TaiseiSimStateBuffers); }
++size_t taisei_sim_sizeof_player_state(void) { return sizeof(TaiseiSimPlayerState); }
++size_t taisei_sim_sizeof_boss_state(void) { return sizeof(TaiseiSimBossState); }
++size_t taisei_sim_sizeof_projectile_state(void) { return sizeof(TaiseiSimProjectileState); }
++size_t taisei_sim_sizeof_enemy_state(void) { return sizeof(TaiseiSimEnemyState); }
++size_t taisei_sim_sizeof_item_state(void) { return sizeof(TaiseiSimItemState); }
++size_t taisei_sim_sizeof_laser_state(void) { return sizeof(TaiseiSimLaserState); }
++size_t taisei_sim_sizeof_laser_point(void) { return sizeof(TaiseiSimLaserPoint); }
+diff --git a/src/sim/taisei_sim.h b/src/sim/taisei_sim.h
+new file mode 100644
+index 00000000..4deeb0ec
+--- /dev/null
++++ b/src/sim/taisei_sim.h
+@@ -0,0 +1,433 @@
++/*
++ * C API for headless Taisei simulations.
++ *
++ * It is self contained.
++ * For coordinates use Taisei's 480x560 playfield with (0, 0) at
++ * the top-left, +x to the right, and +y downward.
++ */
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++#if defined(_WIN32)
++# if defined(TAISEI_SIM_BUILD)
++#  define TAISEI_SIM_API __declspec(dllexport)
++# else
++#  define TAISEI_SIM_API __declspec(dllimport)
++# endif
++#elif defined(__GNUC__)
++# define TAISEI_SIM_API __attribute__((visibility("default")))
++#else
++# define TAISEI_SIM_API
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define TAISEI_SIM_API_VERSION UINT32_C(1)
++#define TAISEI_SIM_USE_DEFAULT_I32 INT32_C(-2147483647)
++#define TAISEI_SIM_USE_DEFAULT_U64 UINT64_MAX
++
++#define TAISEI_SIM_VIEWPORT_WIDTH 480.0
++#define TAISEI_SIM_VIEWPORT_HEIGHT 560.0
++
++#define TAISEI_SIM_ACTION_UP      (UINT32_C(1) << 0)
++#define TAISEI_SIM_ACTION_DOWN    (UINT32_C(1) << 1)
++#define TAISEI_SIM_ACTION_LEFT    (UINT32_C(1) << 2)
++#define TAISEI_SIM_ACTION_RIGHT   (UINT32_C(1) << 3)
++#define TAISEI_SIM_ACTION_FOCUS   (UINT32_C(1) << 4)
++#define TAISEI_SIM_ACTION_SHOT    (UINT32_C(1) << 5)
++#define TAISEI_SIM_ACTION_BOMB    (UINT32_C(1) << 6)
++#define TAISEI_SIM_ACTION_SPECIAL (UINT32_C(1) << 7)
++#define TAISEI_SIM_ACTION_ALL     UINT32_C(0xff)
++
++#define TAISEI_SIM_INPUT_UP    (UINT32_C(1) << 0)
++#define TAISEI_SIM_INPUT_DOWN  (UINT32_C(1) << 1)
++#define TAISEI_SIM_INPUT_LEFT  (UINT32_C(1) << 2)
++#define TAISEI_SIM_INPUT_RIGHT (UINT32_C(1) << 3)
++#define TAISEI_SIM_INPUT_FOCUS (UINT32_C(1) << 4)
++#define TAISEI_SIM_INPUT_SHOT  (UINT32_C(1) << 5)
++#define TAISEI_SIM_INPUT_SKIP  (UINT32_C(1) << 6)
++
++typedef uint32_t TaiseiSimDifficulty;
++enum {
++    TAISEI_SIM_DIFFICULTY_DEFAULT = 0,
++    TAISEI_SIM_DIFFICULTY_EASY = 1,
++    TAISEI_SIM_DIFFICULTY_NORMAL = 2,
++    TAISEI_SIM_DIFFICULTY_HARD = 3,
++    TAISEI_SIM_DIFFICULTY_LUNATIC = 4,
++};
++
++typedef uint32_t TaiseiSimProjectileCategory;
++enum {
++    TAISEI_SIM_PROJECTILE_INVALID = 0,
++    TAISEI_SIM_PROJECTILE_ENEMY = 1,
++    TAISEI_SIM_PROJECTILE_CLEARING = 2,
++    TAISEI_SIM_PROJECTILE_PLAYER = 3,
++};
++
++typedef uint32_t TaiseiSimDamageType;
++enum {
++    TAISEI_SIM_DAMAGE_UNDEFINED = 0,
++    TAISEI_SIM_DAMAGE_ENEMY_SHOT = 1,
++    TAISEI_SIM_DAMAGE_ENEMY_COLLISION = 2,
++    TAISEI_SIM_DAMAGE_PLAYER_SHOT = 3,
++    TAISEI_SIM_DAMAGE_PLAYER_BOMB = 4,
++    TAISEI_SIM_DAMAGE_PLAYER_DISCHARGE = 5,
++};
++
++#define TAISEI_SIM_PROJECTILE_FLAG_GRAZEABLE         (UINT32_C(1) << 0)
++#define TAISEI_SIM_PROJECTILE_FLAG_CLEARABLE         (UINT32_C(1) << 1)
++#define TAISEI_SIM_PROJECTILE_FLAG_COLLISION_ENABLED (UINT32_C(1) << 2)
++#define TAISEI_SIM_PROJECTILE_FLAG_INDESTRUCTIBLE     (UINT32_C(1) << 3)
++#define TAISEI_SIM_PROJECTILE_FLAG_ACTIVE_HAZARD      (UINT32_C(1) << 4)
++
++#define TAISEI_SIM_ENEMY_FLAG_KILLED       (UINT32_C(1) << 0)
++#define TAISEI_SIM_ENEMY_FLAG_TARGETABLE   (UINT32_C(1) << 1)
++#define TAISEI_SIM_ENEMY_FLAG_DAMAGEABLE   (UINT32_C(1) << 2)
++#define TAISEI_SIM_ENEMY_FLAG_HARMFUL      (UINT32_C(1) << 3)
++#define TAISEI_SIM_ENEMY_FLAG_INVULNERABLE (UINT32_C(1) << 4)
++#define TAISEI_SIM_ENEMY_FLAG_IMPENETRABLE (UINT32_C(1) << 5)
++#define TAISEI_SIM_ENEMY_FLAG_NO_AUTOKILL  (UINT32_C(1) << 6)
++
++#define TAISEI_SIM_CLEAR_FLAG_BULLETS        (UINT32_C(1) << 0)
++#define TAISEI_SIM_CLEAR_FLAG_LASERS         (UINT32_C(1) << 1)
++#define TAISEI_SIM_CLEAR_FLAG_FORCED         (UINT32_C(1) << 2)
++#define TAISEI_SIM_CLEAR_FLAG_IMMEDIATE      (UINT32_C(1) << 3)
++#define TAISEI_SIM_CLEAR_FLAG_SPAWNS_VOLTAGE (UINT32_C(1) << 4)
++
++#define TAISEI_SIM_LASER_POINT_FLAG_DISCONTINUITY (UINT32_C(1) << 0)
++
++typedef uint32_t TaiseiSimItemType;
++enum {
++    TAISEI_SIM_ITEM_PIV = 1,
++    TAISEI_SIM_ITEM_POINTS = 2,
++    TAISEI_SIM_ITEM_POWER_MINI = 3,
++    TAISEI_SIM_ITEM_POWER = 4,
++    TAISEI_SIM_ITEM_SURGE = 5,
++    TAISEI_SIM_ITEM_VOLTAGE = 6,
++    TAISEI_SIM_ITEM_BOMB_FRAGMENT = 7,
++    TAISEI_SIM_ITEM_LIFE_FRAGMENT = 8,
++    TAISEI_SIM_ITEM_BOMB = 9,
++    TAISEI_SIM_ITEM_LIFE = 10,
++};
++
++typedef struct TaiseiSim TaiseiSim;
++
++typedef int32_t TaiseiSimResult;
++enum {
++    TAISEI_SIM_OK = 0,
++    TAISEI_SIM_ERROR_INVALID_ARGUMENT = -1,
++    TAISEI_SIM_ERROR_INVALID_HANDLE = -2,
++    TAISEI_SIM_ERROR_NOT_INITIALIZED = -3,
++    TAISEI_SIM_ERROR_ALREADY_INITIALIZED = -4,
++    TAISEI_SIM_ERROR_SIMULATION_ACTIVE = -5,
++    TAISEI_SIM_ERROR_NO_ACTIVE_EPISODE = -6,
++    TAISEI_SIM_ERROR_EPISODE_RUNNING = -7,
++    TAISEI_SIM_ERROR_EPISODE_TERMINAL = -8,
++    TAISEI_SIM_ERROR_STAGE_NOT_FOUND = -9,
++    TAISEI_SIM_ERROR_PLAYER_MODE_NOT_FOUND = -10,
++    TAISEI_SIM_ERROR_BUFFER_TOO_SMALL = -11,
++    TAISEI_SIM_ERROR_IO = -12,
++    TAISEI_SIM_ERROR_ABI_MISMATCH = -13,
++    TAISEI_SIM_ERROR_INTERNAL = -14,
++};
++
++typedef uint32_t TaiseiSimEpisodeStatus;
++enum {
++    TAISEI_SIM_STATUS_INVALID = 0,
++    TAISEI_SIM_STATUS_RUNNING = 1,
++    TAISEI_SIM_STATUS_WON = 2,
++    TAISEI_SIM_STATUS_LOST = 3,
++    TAISEI_SIM_STATUS_ABORTED = 4,
++    TAISEI_SIM_STATUS_ERROR = 5,
++};
++
++typedef uint32_t TaiseiSimStageType;
++enum {
++    TAISEI_SIM_STAGE_UNKNOWN = 0,
++    TAISEI_SIM_STAGE_STORY = 1,
++    TAISEI_SIM_STAGE_EXTRA = 2,
++    TAISEI_SIM_STAGE_SPELL = 3,
++    TAISEI_SIM_STAGE_SPECIAL = 4,
++};
++
++typedef uint32_t TaiseiSimBossPhaseType;
++enum {
++    TAISEI_SIM_BOSS_PHASE_NONE = 0,
++    TAISEI_SIM_BOSS_PHASE_NONSPELL = 1,
++    TAISEI_SIM_BOSS_PHASE_MOVE = 2,
++    TAISEI_SIM_BOSS_PHASE_SPELL = 3,
++    TAISEI_SIM_BOSS_PHASE_SURVIVAL = 4,
++    TAISEI_SIM_BOSS_PHASE_EXTRA = 5,
++};
++
++typedef struct TaiseiSimVec2 {
++    double x;
++    double y;
++} TaiseiSimVec2;
++
++typedef struct TaiseiSimGlobalConfig {
++    //sizeof(TaiseiSimGlobalConfig)
++    uint32_t struct_size;
++    //TAISEI_SIM_API_VERSION
++    uint32_t api_version;
++    // Optional, NULL can be.
++    const char *resource_path;
++    const char *storage_path;
++    const char *cache_path;
++    // == 0
++    uint32_t flags;
++    uint32_t reserved;
++} TaiseiSimGlobalConfig;
++
++typedef struct TaiseiSimConfig {
++    //sizeof(TaiseiSimConfig)
++    uint32_t struct_size;
++    // == 0
++    uint32_t flags;
++    double laser_sample_step;
++    // ==0
++    uint32_t reserved;
++} TaiseiSimConfig;
++
++typedef struct TaiseiSimEpisodeConfig {
++    //sizeof(TaiseiSimEpisodeConfig)
++    uint32_t struct_size;
++    uint16_t stage_id;
++    uint8_t difficulty;
++    uint8_t player_character;
++    uint8_t shot_mode;
++    uint8_t practice_mode;
++    uint16_t reserved0;
++    uint64_t rng_seed;
++    // TAISEI_SIM_USE_DEFAULT_U64
++    uint64_t start_time;
++    //TAISEI_SIM_USE_DEFAULT_I32
++    int32_t initial_lives;
++    int32_t initial_bombs;
++    int32_t initial_life_fragments;
++    int32_t initial_bomb_fragments;
++    int32_t initial_power;
++    int32_t initial_point_item_value;
++    uint64_t initial_score;
++    uint32_t initial_graze;
++    uint32_t reserved1;
++} TaiseiSimEpisodeConfig;
++
++typedef struct TaiseiSimAction {
++    //sizeof(TaiseiSimAction)
++    uint32_t struct_size;
++    uint32_t buttons;
++} TaiseiSimAction;
++
++typedef struct TaiseiSimPlayerState {
++    TaiseiSimVec2 position;
++    TaiseiSimVec2 previous_position;
++    TaiseiSimVec2 velocity;
++    uint32_t input_flags;
++    uint32_t focused;
++    uint32_t shooting;
++    int32_t lives;
++    int32_t bombs;
++    int32_t life_fragments;
++    int32_t bomb_fragments;
++    int32_t stored_power;
++    int32_t effective_power;
++    uint32_t point_item_value;
++    uint64_t score;
++    uint32_t graze;
++    uint32_t voltage;
++    uint32_t invulnerable;
++    uint32_t recovering;
++    uint32_t alive;
++    int32_t death_timer;
++    int32_t respawn_timer;
++    int32_t recovery_timer;
++    uint32_t bomb_active;
++    double bomb_progress;
++    int32_t bomb_trigger_frame;
++    int32_t bomb_end_frame;
++    uint32_t power_surge_active;
++    float power_surge_positive;
++    float power_surge_negative;
++    uint8_t player_character;
++    uint8_t shot_mode;
++    uint16_t reserved;
++} TaiseiSimPlayerState;
++
++typedef struct TaiseiSimBossState {
++    uint32_t active;
++    TaiseiSimVec2 position;
++    TaiseiSimVec2 velocity;
++    float hp;
++    float max_hp;
++    uint32_t invulnerable;
++    int32_t phase_index;
++    uint32_t phase_type;
++    uint16_t attack_id;
++    uint16_t spell_id;
++    uint32_t spell_active;
++    int32_t phase_start_frame;
++    int32_t phase_end_frame;
++    int32_t phase_timeout_frames;
++    int32_t remaining_timeout_frames;
++    int32_t spell_failed_frame;
++    uint32_t spell_failed;
++    uint32_t spell_captured;
++    float recent_damage;
++} TaiseiSimBossState;
++
++typedef struct TaiseiSimProjectileState {
++    uint32_t spawn_id;
++    uint32_t category;
++    TaiseiSimVec2 position;
++    TaiseiSimVec2 previous_position;
++    TaiseiSimVec2 velocity;
++    TaiseiSimVec2 collision_size;
++    float damage;
++    float angle;
++    int32_t age_frames;
++    uint32_t flags;
++    uint32_t damage_type;
++    uint32_t clear_flags;
++} TaiseiSimProjectileState;
++
++typedef struct TaiseiSimEnemyState {
++    uint32_t spawn_id;
++    TaiseiSimVec2 position;
++    TaiseiSimVec2 velocity;
++    float hp;
++    float max_hp;
++    float hit_radius;
++    float hurt_radius;
++    int32_t age_frames;
++    uint32_t flags;
++    uint32_t damageable;
++    uint32_t harmful;
++} TaiseiSimEnemyState;
++
++typedef struct TaiseiSimItemState {
++    uint32_t spawn_id;
++    TaiseiSimVec2 position;
++    TaiseiSimVec2 velocity;
++    uint32_t item_type;
++    int32_t age_frames;
++    int32_t collect_frame;
++    uint32_t attracted;
++    float pickup_value;
++} TaiseiSimItemState;
++
++typedef struct TaiseiSimLaserState {
++    uint32_t spawn_id;
++    TaiseiSimVec2 origin;
++    int32_t age_frames;
++    float width;
++    float speed;
++    float timespan;
++    float death_time;
++    float time_shift;
++    uint32_t collision_active;
++    uint32_t unclearable;
++    uint32_t clear_flags;
++    uint32_t first_point;
++    uint32_t point_count;
++} TaiseiSimLaserState;
++
++typedef struct TaiseiSimLaserPoint {
++    TaiseiSimVec2 position;
++    float half_width;
++    float time;
++    uint32_t flags;
++} TaiseiSimLaserPoint;
++
++typedef struct TaiseiSimState {
++    uint32_t struct_size;
++    uint32_t api_version;
++    uint16_t stage_id;
++    uint16_t stage_type;
++    uint8_t difficulty;
++    uint8_t player_character;
++    uint8_t shot_mode;
++    uint8_t practice_mode;
++    uint64_t logical_frame;
++    uint64_t initial_rng_seed;
++    uint64_t start_time;
++    uint32_t episode_status;
++    uint32_t stage_clear;
++    uint32_t game_over;
++    uint32_t reserved0;
++    uint64_t score;
++    uint32_t graze;
++    uint32_t voltage;
++    uint32_t deaths;
++    uint32_t bombs_used;
++    uint32_t continues_used;
++    int32_t gameover_frame;
++    int32_t reserved2;
++    TaiseiSimPlayerState player;
++    TaiseiSimBossState boss;
++    uint32_t projectile_count;
++    uint32_t enemy_count;
++    uint32_t item_count;
++    uint32_t laser_count;
++    uint32_t laser_point_count;
++    uint32_t reserved1;
++    uint64_t gameplay_digest;
++} TaiseiSimState;
++
++typedef struct TaiseiSimStateBuffers {
++    // sizeof(TaiseiSimStateBuffers)
++    uint32_t struct_size;
++    // == 0
++    uint32_t reserved;
++    TaiseiSimProjectileState *projectiles;
++    uint32_t projectile_capacity;
++    TaiseiSimEnemyState *enemies;
++    uint32_t enemy_capacity;
++    TaiseiSimItemState *items;
++    uint32_t item_capacity;
++    TaiseiSimLaserState *lasers;
++    uint32_t laser_capacity;
++    TaiseiSimLaserPoint *laser_points;
++    uint32_t laser_point_capacity;
++} TaiseiSimStateBuffers;
++
++TAISEI_SIM_API uint32_t taisei_sim_api_version(void);
++TAISEI_SIM_API uint64_t taisei_sim_abi_fingerprint(void);
++TAISEI_SIM_API TaiseiSimResult taisei_sim_global_init(const TaiseiSimGlobalConfig *config);
++TAISEI_SIM_API TaiseiSimResult taisei_sim_global_shutdown(void);
++TAISEI_SIM_API TaiseiSimResult taisei_sim_create(const TaiseiSimConfig *config, TaiseiSim **out_sim);
++TAISEI_SIM_API TaiseiSimResult taisei_sim_reset(TaiseiSim *sim, const TaiseiSimEpisodeConfig *episode);
++TAISEI_SIM_API TaiseiSimResult taisei_sim_step(TaiseiSim *sim, const TaiseiSimAction *action, uint32_t frame_count);
++// frame_count may be zero.. 
++// Terminates a running episode.
++TAISEI_SIM_API TaiseiSimResult taisei_sim_abort(TaiseiSim *sim);
++
++TAISEI_SIM_API TaiseiSimResult taisei_sim_get_state(TaiseiSim *sim, TaiseiSimState *out_state, const TaiseiSimStateBuffers *buffers);
++// Saves the replay for log.
++TAISEI_SIM_API TaiseiSimResult taisei_sim_save_replay(TaiseiSim *sim, const char *path);
++TAISEI_SIM_API TaiseiSimResult taisei_sim_destroy(TaiseiSim *sim);
++
++TAISEI_SIM_API const char *taisei_sim_last_error(const TaiseiSim *sim);
++
++TAISEI_SIM_API size_t taisei_sim_sizeof_vec2(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_global_config(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_config(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_episode_config(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_action(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_state(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_state_buffers(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_player_state(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_boss_state(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_projectile_state(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_enemy_state(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_item_state(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_laser_state(void);
++TAISEI_SIM_API size_t taisei_sim_sizeof_laser_point(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/stage.c b/src/stage.c
+index fdfb3e1a..4e533154 100644
+--- a/src/stage.c
++++ b/src/stage.c
+@@ -54,6 +54,29 @@ typedef struct StageFrameState {
+ 
+ static StageFrameState *_current_stage_state;  // TODO remove this shitty hack
+ 
++static struct {
++	StageExternalInputHook hook;
++	void *userdata;
++} external_input;
++
++static StageStartOverride start_override;
++static bool start_override_pending;
++
++void stage_set_external_input_hook(StageExternalInputHook hook, void *userdata) {
++	external_input.hook = hook;
++	external_input.userdata = userdata;
++}
++
++void stage_set_start_override(const StageStartOverride *override) {
++	if(override) {
++		start_override = *override;
++		start_override_pending = true;
++	} else {
++		start_override = (typeof(start_override)) {};
++		start_override_pending = false;
++	}
++}
++
+ #define BGM_FADE_LONG (2.0 * FADE_TIME / (double)FPS)
+ #define BGM_FADE_SHORT (FADE_TIME / (double)FPS)
+ 
+@@ -184,6 +207,18 @@ static void stage_start(StageInfo *stage) {
+ 
+ 	global.plr.power_stored = clamp(global.plr.power_stored, 0, PLR_MAX_POWER_STORED);
+ 
++	if(start_override_pending && global.replay.input.replay == NULL) {
++		uint32_t f = start_override.flags;
++		if(f & STAGE_START_OVERRIDE_LIVES) global.plr.lives = start_override.lives;
++		if(f & STAGE_START_OVERRIDE_BOMBS) global.plr.bombs = start_override.bombs;
++		if(f & STAGE_START_OVERRIDE_LIFE_FRAGMENTS) global.plr.life_fragments = start_override.life_fragments;
++		if(f & STAGE_START_OVERRIDE_BOMB_FRAGMENTS) global.plr.bomb_fragments = start_override.bomb_fragments;
++		if(f & STAGE_START_OVERRIDE_POWER) global.plr.power_stored = clamp(start_override.power, 0, PLR_MAX_POWER_STORED);
++		if(f & STAGE_START_OVERRIDE_PIV) global.plr.point_item_value = start_override.point_item_value;
++		if(f & STAGE_START_OVERRIDE_SCORE) global.plr.points = start_override.score;
++		if(f & STAGE_START_OVERRIDE_GRAZE) global.plr.graze = start_override.graze;
++	}
++
+ 	reset_all_sfx();
+ }
+ 
+@@ -338,6 +373,11 @@ static void gameover_menu_result(CallChainResult ccr) {
+ }
+ 
+ void stage_gameover(void) {
++	if(global.is_simulation) {
++		stage_finish(GAMEOVER_DEFEAT);
++		return;
++	}
++
+ 	if(global.stage->type == STAGE_SPELL && config_get_int(CONFIG_SPELLSTAGE_AUTORESTART)) {
+ 		auto fstate = _current_stage_state;
+ 		if(fstate->quicksave) {
+@@ -811,6 +851,7 @@ void stage_finish(int gameover) {
+ 	}
+ 
+ 	if(
++		!global.is_simulation &&
+ 		global.replay.input.replay == NULL &&
+ 		prev_gameover != GAMEOVER_SCORESCREEN &&
+ 		(gameover == GAMEOVER_SCORESCREEN || gameover == GAMEOVER_WIN)
+@@ -957,7 +998,9 @@ static LogicFrameAction stage_logic_frame(void *arg) {
+ 	StageFrameState *fstate = arg;
+ 	StageInfo *stage = fstate->stage;
+ 
+-	stage_update_fps(fstate);
++	if(!global.is_simulation) {
++		stage_update_fps(fstate);
++	}
+ 
+ 	if(watchdog_signaled() && !stage_is_demo_mode()) {
+ 		global.gameover = GAMEOVER_ABORT;
+@@ -971,6 +1014,7 @@ static LogicFrameAction stage_logic_frame(void *arg) {
+ 	fapproach_asymptotic_p(&fstate->view_shake, 0, 0.05, 1e-2);
+ 
+ 	if(
++		!global.is_simulation &&
+ 		global.replay.input.replay == NULL &&
+ 		fstate->dynstage_generation != dynstage_get_generation()
+ 	) {
+@@ -981,7 +1025,10 @@ static LogicFrameAction stage_logic_frame(void *arg) {
+ 
+ 	if(global.gameover == GAMEOVER_TRANSITIONING) {
+ 		// Usually stage_comain will do this
+-		events_poll(NULL, 0);
++		// events_poll(NULL, 0);
++		if(!global.is_simulation) {
++			events_poll(NULL, 0);
++		}
+ 	} else {
+ 		cosched_run_tasks(&fstate->sched);
+ 		update_all_sfx();
+@@ -1031,11 +1078,19 @@ static LogicFrameAction stage_logic_frame(void *arg) {
+ 		update_transition();
+ 	}
+ 
+-	if(global.replay.input.replay == NULL) {
++	if(global.replay.input.replay == NULL && !global.is_simulation) {
+ 		StageProgress *p = NOT_NULL(stageinfo_get_progress(fstate->stage, global.diff, true));
+ 		progress_register_hiscore(p, global.plr.mode, global.plr.points);
+ 	}
+ 
++	if(
++		global.is_simulation &&
++		global.gameover == GAMEOVER_SCORESCREEN &&
++		global.frames - global.gameover_time > GAMEOVER_SCORE_DELAY
++	) {
++		stage_finish(GAMEOVER_WIN);
++	}
++
+ 	if(fstate->quickload_requested) {
+ 		log_info("Quickload initiated");
+ 		return LFRAME_STOP;
+@@ -1093,6 +1148,9 @@ static void stage_preload_stub_proc(ResourceGroup *rg) { }
+ static void process_input(StageFrameState *fstate) {
+ 	if(global.replay.input.replay != NULL) {
+ 		replay_input(fstate);
++	} else if(external_input.hook != NULL) {
++		external_input.hook(external_input.userdata);
++		player_applymovement(&global.plr);
+ 	} else {
+ 		stage_input(fstate);
+ 	}
+@@ -1218,10 +1276,24 @@ static void _stage_enter(
+ 		start_time = (uint64_t)time(0);
+ 		seed = makeseed();
+ 
+-		StageProgress *p = NOT_NULL(stageinfo_get_progress(stage, global.diff, true));
+-		progress_register_stage_played(p, global.plr.mode);
++		if(start_override_pending) {
++			if(start_override.flags & STAGE_START_OVERRIDE_START_TIME) {
++				start_time = start_override.start_time;
++			}
++			if(start_override.flags & STAGE_START_OVERRIDE_SEED) {
++				seed = start_override.seed;
++			}
++		}
++
++		if(!global.is_simulation) {
++			StageProgress *p = NOT_NULL(stageinfo_get_progress(stage, global.diff, true));
++			progress_register_stage_played(p, global.plr.mode);
++		}
+ 	}
+ 
++	start_override = (typeof(start_override)) {};
++	start_override_pending = false;
++
+ 	rng_seed(&global.rand_game, seed);
+ 
+ 	if(global.replay.input.replay) {
+@@ -1346,7 +1418,7 @@ void stage_end_loop(void *ctx) {
+ }
+ 
+ void stage_unlock_bgm(const char *bgm) {
+-	if(global.replay.input.replay == NULL && !global.plr.stats.total.continues_used) {
++	if(!global.is_simulation && global.replay.input.replay == NULL && !global.plr.stats.total.continues_used) {
+ 		progress_unlock_bgm(bgm);
+ 	}
+ }
+diff --git a/src/stage.h b/src/stage.h
+index 50352504..48517404 100644
+--- a/src/stage.h
++++ b/src/stage.h
+@@ -28,6 +28,39 @@ typedef struct StageClearBonus {
+ } StageClearBonus;
+ 
+ void stage_enter(StageInfo *stage, ResourceGroup *rg, CallChain next);
++
++typedef void (*StageExternalInputHook)(void *userdata);
++void stage_set_external_input_hook(StageExternalInputHook hook, void *userdata);
++
++typedef enum StageStartOverrideFlag {
++	STAGE_START_OVERRIDE_SEED = (1u << 0),
++	STAGE_START_OVERRIDE_START_TIME = (1u << 1),
++	STAGE_START_OVERRIDE_LIVES = (1u << 2),
++	STAGE_START_OVERRIDE_BOMBS = (1u << 3),
++	STAGE_START_OVERRIDE_LIFE_FRAGMENTS = (1u << 4),
++	STAGE_START_OVERRIDE_BOMB_FRAGMENTS = (1u << 5),
++	STAGE_START_OVERRIDE_POWER = (1u << 6),
++	STAGE_START_OVERRIDE_PIV = (1u << 7),
++	STAGE_START_OVERRIDE_SCORE = (1u << 8),
++	STAGE_START_OVERRIDE_GRAZE = (1u << 9),
++} StageStartOverrideFlag;
++
++typedef struct StageStartOverride {
++	uint32_t flags;
++	uint64_t seed;
++	uint64_t start_time;
++	int lives;
++	int bombs;
++	int life_fragments;
++	int bomb_fragments;
++	int power;
++	uint point_item_value;
++	uint64_t score;
++	uint graze;
++} StageStartOverride;
++
++// Applies to the next non-replay stage only and is consumed by stage_enter().
++void stage_set_start_override(const StageStartOverride *override);
+ void stage_finish(int gameover);
+ void stage_gameover(void);
+ 
+diff --git a/src/stages/stage6/background_anim.c b/src/stages/stage6/background_anim.c
+index 2492131b..3c096151 100644
+--- a/src/stages/stage6/background_anim.c
++++ b/src/stages/stage6/background_anim.c
+@@ -7,8 +7,6 @@
+  */
+ 
+ #include "background_anim.h"
+-#include "draw.h"
+-
+ #include "stageutils.h"
+ #include "common_tasks.h"
+ 
+@@ -31,6 +29,8 @@ void stage6_bg_start_fall_over(void) {
+ }
+ 
+ 
++static BoxedTask boss_rotation_task;
++
+ TASK(stage6_bg_boss_rotation) {
+ 	Camera3D *cam = &stage_3d_context.cam;
+ 	float r = sqrt(cam->pos[0] * cam->pos[0] + cam->pos[1] * cam->pos[1]);
+@@ -46,13 +46,13 @@ TASK(stage6_bg_boss_rotation) {
+ }
+ 
+ void stage6_bg_start_boss_rotation(void) {
+-	Stage6DrawData *drawdata = stage6_get_draw_data();
+-	drawdata->boss_rotation = cotask_box(INVOKE_TASK(stage6_bg_boss_rotation));
++	CANCEL_TASK(boss_rotation_task);
++	boss_rotation_task = cotask_box(INVOKE_TASK(stage6_bg_boss_rotation));
+ }
+ 
+ void stage6_bg_stop_boss_rotation(void) {
+-	Stage6DrawData *drawdata = stage6_get_draw_data();
+-	CANCEL_TASK(drawdata->boss_rotation);
++	CANCEL_TASK(boss_rotation_task);
++	boss_rotation_task = (BoxedTask) {};
+ 	Camera3D *cam = &stage_3d_context.cam;
+ 	cam->rot.v[2] = 270;
+ 	cam->pos[0] = -6;
+@@ -110,6 +110,7 @@ TASK(stage6_bg_update) {
+ }
+ 
+ void stage6_bg_init_fullstage(void) {
++	boss_rotation_task = (BoxedTask) {};
+ 	Camera3D *cam = &stage_3d_context.cam;
+ 	cam->rot.v[0] = 90;
+ 	cam->fovy = STAGE3D_DEFAULT_FOVY*1.5;
+@@ -118,6 +119,7 @@ void stage6_bg_init_fullstage(void) {
+ }
+ 
+ void stage6_bg_init_spellpractice(void) {
++	boss_rotation_task = (BoxedTask) {};
+ 	Camera3D *cam = &stage_3d_context.cam;
+ 	cam->pos[0] = -6;
+ 	cam->pos[2] = 8;
+diff --git a/src/stages/stage6/draw.h b/src/stages/stage6/draw.h
+index 219f4646..b0b45766 100644
+--- a/src/stages/stage6/draw.h
++++ b/src/stages/stage6/draw.h
+@@ -32,8 +32,6 @@ typedef struct Stage6DrawData {
+ 		FBPair fbpair;
+ 	} baryon;
+ 
+-	BoxedTask boss_rotation;
+-
+ 	struct {
+ 		PBRModel rim;
+ 		PBRModel spires;
